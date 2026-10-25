@@ -62,9 +62,12 @@ function sessionCookie(id, maxAge) {
 
 function requireSameOrigin(request) {
   if (safeMethods.has(request.method)) return;
-  const origin = request.headers.origin;
   const hostHeader = request.headers.host;
-  if (!origin || !hostHeader) throw fail(403, "Same-origin request required");
+  if (!hostHeader) throw fail(403, "Same-origin request required");
+  const origin = request.headers.origin;
+  // A same-origin fetch does not send an Origin header; only cross-origin
+  // requests do. A missing Origin therefore implies same-origin.
+  if (!origin) return;
   let parsed;
   try {
     parsed = new URL(origin);
