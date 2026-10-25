@@ -52,6 +52,7 @@
             <a href="#" data-server-section="plugins" class="nav-item"><span class="nav-icon">◇</span>Plugins</a>
             <a href="#" data-server-section="worlds" class="nav-item"><span class="nav-icon">▧</span>Worlds</a>
             <a href="#" data-server-section="players" class="nav-item"><span class="nav-icon">♙</span>Players & settings</a>
+            <a href="#" data-server-section="settings" class="nav-item"><span class="nav-icon">⚙</span>Server software</a>
             <a href="#" data-server-section="console" class="nav-item"><span class="nav-icon">›_</span>Console</a>
             <a href="#" data-server-section="logs" class="nav-item"><span class="nav-icon">≡</span>Logs</a>
           </nav>
@@ -190,6 +191,16 @@
     </dialog>
 
     <template id="server-management-template">
+        <section id="manage-settings" class="manage-panel" role="tabpanel" hidden>
+          <div class="manage-section-heading"><div><h3>Minecraft version & server software</h3><p>Change the game version or loader after the server has been created.</p></div></div>
+          <div class="catalog-callout"><span class="callout-icon">ⓘ</span><div><strong>Safe runtime change</strong><p>A full backup is created first. Your worlds, server settings, mods, and plugins are preserved, but mods/plugins may not work with the new runtime. The server must be stopped.</p></div></div>
+          <form id="runtime-change-form" class="form-grid runtime-change-form">
+            <label class="field">Minecraft version<select name="minecraftVersion" id="runtime-version" required></select></label>
+            <label class="field">Server software<select name="software" id="runtime-software" required><option value="vanilla">Vanilla</option><option value="fabric">Fabric</option><option value="forge">Forge</option><option value="neoforge">NeoForge</option><option value="quilt">Quilt</option><option value="paper">Paper</option><option value="purpur">Purpur</option></select></label>
+            <p id="runtime-compatibility-hint" class="field-wide muted"></p>
+            <div class="field-wide"><button class="button button-primary" type="submit">Back up & change runtime</button></div>
+          </form>
+        </section>
         <section id="manage-files" class="manage-panel active" role="tabpanel">
           <h3>Server files</h3>
           <div class="file-toolbar"><button id="file-up" class="button button-secondary button-small" type="button">Up</button><span id="file-path-label">/</span><button id="file-reload" class="button button-secondary button-small" type="button">Refresh</button></div><div id="file-list" class="file-list"></div>
@@ -217,15 +228,28 @@
         <section id="manage-players" class="manage-panel" role="tabpanel" hidden>
           <div class="manage-section-heading"><div><h3>Players, world settings & datapacks</h3><p>Manage player access and common world settings using validated server commands.</p></div></div>
           <div class="world-admin-section"><form id="admin-command-form" class="admin-command-form">
-            <label class="field">Action<select name="action"><option value="ban">Ban player</option><option value="pardon">Pardon player</option><option value="ban-ip">Ban IP/player</option><option value="whitelist.add">Whitelist add</option><option value="whitelist.remove">Whitelist remove</option><option value="whitelist.list">Whitelist list</option><option value="whitelist.on">Whitelist on</option><option value="whitelist.off">Whitelist off</option><option value="op">Grant operator</option><option value="deop">Remove operator</option><option value="list">List players</option><option value="save-all">Save world</option><option value="difficulty">Set difficulty</option><option value="time">Set/add time</option><option value="weather">Set weather</option><option value="datapack.list">List datapacks</option><option value="datapack.enable">Enable datapack</option><option value="datapack.disable">Disable datapack</option></select></label>
-            <label class="field">Player / target<input name="player" maxlength="40" autocomplete="off"></label>
-            <label class="field">Reason <span class="optional">Optional</span><input name="reason" maxlength="256"></label>
-            <label class="field">Setting / datapack name<input name="name" maxlength="128"></label>
-            <label class="field">Operation/value<input name="value" maxlength="32" placeholder="set day, add 1000, night"></label>
-            <label class="field">Difficulty / weather<input name="level" maxlength="16" placeholder="normal / rain"></label>
-            <button class="button button-secondary" type="submit">Run admin action</button>
+            <label class="field">What do you want to do?<select name="action">
+              <option value="list">Show players online</option><option value="ban">Ban a player</option><option value="pardon">Unban a player</option><option value="ban-ip">Ban a player or IP address</option>
+              <option value="whitelist.list">Show whitelist</option><option value="whitelist.add">Add player to whitelist</option><option value="whitelist.remove">Remove player from whitelist</option><option value="whitelist.on">Turn whitelist on</option><option value="whitelist.off">Turn whitelist off</option>
+              <option value="op">Make player an operator</option><option value="deop">Remove operator access</option><option value="save-all">Save the world</option>
+              <option value="difficulty">Change difficulty</option><option value="time">Change world time</option><option value="weather">Change weather</option>
+              <option value="datapack.list">List datapacks</option><option value="datapack.enable">Enable a datapack</option><option value="datapack.disable">Disable a datapack</option>
+            </select></label>
+            <label class="field" data-admin-field="player">Player name or IP<input name="player" maxlength="40" autocomplete="off" placeholder="e.g. Alex"></label>
+            <label class="field" data-admin-field="reason">Reason <span class="optional">Optional</span><input name="reason" maxlength="256" placeholder="Why is this player being banned?"></label>
+            <label class="field" data-admin-field="difficulty">Choose difficulty<select name="difficulty"><option value="peaceful">Peaceful</option><option value="easy">Easy</option><option value="normal">Normal</option><option value="hard">Hard</option></select></label>
+            <label class="field" data-admin-field="time-operation">Time action<select name="timeOperation"><option value="set">Set time to</option><option value="add">Add ticks</option></select></label>
+            <label class="field" data-admin-field="time-value">World time<select name="timePreset"><option value="day">Day</option><option value="noon">Noon</option><option value="night">Night</option><option value="midnight">Midnight</option></select></label>
+            <label class="field" data-admin-field="time-ticks" hidden>Ticks to add<input name="timeTicks" type="number" min="0" max="2147483647" value="1000"></label>
+            <label class="field" data-admin-field="weather">Weather<select name="weatherType"><option value="clear">Clear</option><option value="rain">Rain</option><option value="thunder">Thunderstorm</option></select></label>
+            <label class="field" data-admin-field="duration">Duration <span class="optional">Optional, seconds</span><input name="duration" type="number" min="1" max="1000000" placeholder="Default duration"></label>
+            <label class="field" data-admin-field="datapack-list">Which datapacks?<select name="datapackList"><option value="">All datapacks</option><option value="available">Available (disabled)</option><option value="enabled">Currently enabled</option></select></label>
+            <label class="field" data-admin-field="datapack-name">Datapack ID/name<input name="datapackName" maxlength="128" placeholder="e.g. vanilla or namespace:pack_name"><small>Use “List datapacks” first to see IDs available on this server.</small></label>
+            <p id="admin-action-description" class="field-wide muted"></p>
+            <button class="button button-secondary" type="submit">Run action</button>
           </form>
-          <p class="console-warning">Available only while the server is running. Commands are allowlisted and validated; results appear in Logs.</p></div>
+          <pre id="admin-action-result" class="admin-action-result" role="status" hidden></pre>
+          <p class="console-warning">Available only while the server is running. Commands are allowlisted and validated; results show here.</p></div>
         </section>
         <section id="manage-console" class="manage-panel" role="tabpanel" hidden>
           <h3>Server console</h3><div class="console-status" id="console-status"></div>

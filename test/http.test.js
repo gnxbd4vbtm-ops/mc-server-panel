@@ -98,7 +98,7 @@ test('serves the dashboard and protects local API mutations from foreign origins
   assert.equal(page.status, 200);
   const pageMarkup = await page.text();
   assert.match(pageMarkup, /Byte Server Panel/);
-  for (const section of ['overview', 'files', 'mods', 'plugins', 'worlds', 'players', 'console', 'logs']) {
+  for (const section of ['overview', 'files', 'mods', 'plugins', 'worlds', 'players', 'settings', 'console', 'logs']) {
     assert.match(pageMarkup, new RegExp(`data-server-section="${section}"`));
   }
   assert.match(pageMarkup, /id="page-server"/);
@@ -106,6 +106,8 @@ test('serves the dashboard and protects local API mutations from foreign origins
   assert.match(pageMarkup, /id="console-output"/);
   assert.match(pageMarkup, /id="modrinth-compatibility"/);
   assert.match(pageMarkup, /id="manage-players"/);
+  assert.match(pageMarkup, /id="runtime-change-form"/);
+  assert.match(pageMarkup, /id="admin-action-description"/);
   assert.match(pageMarkup, /<select name="minecraftVersion" id="create-version"/);
   assert.equal(pageMarkup.includes('id="minecraft-versions"'), false);
   assert.equal(pageMarkup.includes('id="admin-dialog"'), false);
@@ -115,6 +117,8 @@ test('serves the dashboard and protects local API mutations from foreign origins
   assert.match(appSource, /const MODDED_SOFTWARE = new Set\(\['fabric', 'forge', 'neoforge', 'quilt'\]\)/);
   assert.match(appSource, /const PLUGIN_SOFTWARE = new Set\(\['paper', 'purpur'\]\)/);
   assert.match(appSource, /updateManagedContentCompatibility/);
+  assert.match(appSource, /updateAdminActionFields/);
+  assert.match(appSource, /runtime-change/);
   assert.equal(appSource.includes('>⋯</button>'), false);
 
   assert.equal((await fetch(`${baseUrl}/api/servers`)).status, 401);
@@ -144,6 +148,13 @@ test('serves the dashboard and protects local API mutations from foreign origins
   assert.equal(serverData.name, 'HTTP test');
   assert.equal('directory' in serverData, false);
   assert.equal('processPid' in serverData, false);
+
+  const runtimeWithoutConfirmation = await localFetch(`${baseUrl}/api/servers/${serverData.id}/runtime`, {
+    method: 'POST',
+    headers: { Origin: baseUrl, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ minecraftVersion: '1.21.9', software: 'vanilla' })
+  });
+  assert.equal(runtimeWithoutConfirmation.status, 403);
 
   database.updateServer(serverData.id, { installed: 1 });
   await manager.ensureRconConfiguration(database.getServer(serverData.id));

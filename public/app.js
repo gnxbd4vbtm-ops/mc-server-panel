@@ -19,11 +19,17 @@ const state = {
   fileDirectory: '',
   selectedFile: ''
 };
+let runtimeCompatibilityRequest = 0;
+let runtimeSettingsServerId = null;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const MODDED_SOFTWARE = new Set(['fabric', 'forge', 'neoforge', 'quilt']);
 const PLUGIN_SOFTWARE = new Set(['paper', 'purpur']);
+const SERVER_SOFTWARE_OPTIONS = [
+  ['vanilla', 'Vanilla'], ['fabric', 'Fabric'], ['forge', 'Forge'],
+  ['neoforge', 'NeoForge'], ['quilt', 'Quilt'], ['paper', 'Paper'], ['purpur', 'Purpur']
+];
 const managementTemplate = $('#server-management-template');
 $('#server-page-sections').append(
   ...[...managementTemplate.content.querySelectorAll('.manage-panel')].map((panel) => panel.cloneNode(true))
@@ -237,6 +243,22 @@ async function refresh() {
     state.metrics = Object.fromEntries(metricEntries);
     $('#load-error').classList.add('hidden');
     render();
+    const runtimeTaskFinished = tasks.find((task) =>
+      task.type === 'runtime-change'
+      && task.serverId === state.adminServerId
+      && ['completed', 'failed', 'cancelled'].includes(task.status)
+      && ['queued', 'running', 'cancelling'].includes(previousTasks.get(task.id))
+    );
+    if (runtimeTaskFinished) {
+      if (runtimeTaskFinished.status === 'completed') {
+        toast(runtimeTaskFinished.message || 'Server runtime change completed.');
+      } else if (runtimeTaskFinished.status === 'failed') {
+        toast(runtimeTaskFinished.error || 'Server runtime change failed.', 'error');
+      } else {
+        toast('Server runtime change was cancelled.', 'error');
+      }
+      if (state.currentPage === 'server' && state.manageTab === 'settings') populateRuntimeSettings();
+    }
     updateManagedInstallButtons(tasks);
     const contentInstallFinished = tasks.some((task) =>
       ['content-install', 'modpack-install'].includes(task.type)
@@ -462,7 +484,7 @@ function showPage(route) {
   if (!serverRoute && !knownPages.has(page)) route = 'overview';
 
   if (serverRoute) {
-    let section = ['overview', 'files', 'mods', 'plugins', 'worlds', 'players', 'console', 'logs'].includes(requestedSection)
+    let section = ['overview', 'files', 'mods', 'plugins', 'worlds', 'players', 'settings', 'console', 'logs'].includes(requestedSection)
       ? requestedSection
       : 'overview';
     const server = state.servers.find((item) => item.id === serverId);
@@ -593,7 +615,7 @@ async function updateVersionHint() {
   const hint = $('#version-hint');
   const version = $('#create-version').value.trim();
   if (!version) {
-    hint.textContent = 'Enter a version identifier; Java requirements are checked against Mojang metadata.';
+    hint.textContent = 'Choose an available version; Java requirements are checked against Mojang metadata.';
     return;
   }
   hint.textContent = 'Checking Minecraft Java requirement…';
@@ -629,10 +651,132 @@ async function updateProviderCatalogHint() {
     const detail = stableLoader ? ` Latest stable loader: ${stableLoader.version}.` : '';
     hint.textContent = compatible
       ? `${software} lists Minecraft ${version} as compatible.${detail} The newest stable build is selected during installation.`
-      : `${software} does not list Minecraft ${version} as compatible. It remains selectable; installation will be attempted and may fail if the provider has no build.`;
+      : `${software} does not support Minecraft ${version}. Installation will be stopped before downloading; choose Vanilla or compatible server software.`;
   } catch (error) {
     hint.textContent = `Could not check ${software} compatibility. The version remains selectable; installation will be attempted and may fail. (${error.message})`;
   }
+}
+
+function populateRuntimeSettings() {
+  const server = state.servers.find((item) => item.id === state.adminServerId);
+  const versionSelect = $('#runtime-version');
+  const softwareSelect = $('#runtime-software');
+  const submit = $('#runtime-change-form button[type="submit"]');
+  if (!server) {
+    versionSelect.replaceChildren(new Option('Server not found', ''));
+    versionSelect.disabled = true;
+    softwareSelect.disabled = true;
+    submit.disabled = true;
+    return;
+  }
+  if (!state.versions.length) {
+    versionSelect.replaceChildren(new Option('Loading available versions…', ''));
+    versionSelect.disabled = true;
+    submit.disabled = true;
+    void loadVersions().then(() => {
+      if (state.versions.length) {
+        populateRuntimeSettings();
+      } else {
+        versionSelect.replaceChildren(new Option('Could not load available versions', ''));
+        $('#runtime-compatibility-hint').textContent = 'Refresh the Minecraft version catalogue before changing this server.';
+      }
+    });
+    return;
+  }
+  const previousVersion = runtimeSettingsServerId === server.id
+    ? versionSelect.value
+    : server.minecraftVersion;
+  runtimeSettingsServerId = server.id;
+  versionSelect.innerHTML = state.versions.map((version) =>
+    `<option value="${escapeHtml(version.id)}">${escapeHtml(version.id)} · ${escapeHtml(version.type)}</option>`
+  ).join('');
+  versionSelect.value = state.versions.some((version) => version.id === previousVersion)
+    ? previousVersion
+    : server.minecraftVersion;
+  softwareSelect.value = server.software;
+  versionSelect.disabled = false;
+  softwareSelect.disabled = false;
+  const runtimeTaskActive = state.tasks.some((task) =>
+    task.serverId === server.id
+    && task.type === 'runtime-change'
+    && ['queued', 'running', 'cancelling'].includes(task.status)
+  );
+  submit.disabled = runtimeTaskActive || !['stopped', 'crashed'].includes(server.status);
+  updateRuntimeCompatibilityHint();
+}
+
+async function updateRuntimeCompatibilityHint() {
+  const request = ++runtimeCompatibilityRequest;
+  const software = $('#runtime-software').value;
+  const version = $('#runtime-version').value;
+  const hint = $('#runtime-compatibility-hint');
+  if (!software || !version) {
+    hint.textContent = 'Select a Minecraft version and server software.';
+    return;
+  }
+  if (software === 'vanilla') {
+    hint.textContent = `Vanilla server software will be installed for Minecraft ${version}.`;
+    return;
+  }
+  hint.textContent = `Checking the official ${software} version catalogue…`;
+  try {
+    const catalog = await api(`/api/providers/${encodeURIComponent(software)}/catalog?minecraftVersion=${encodeURIComponent(version)}`);
+    if (request !== runtimeCompatibilityRequest) return;
+    const compatible = catalog.minecraftVersions?.includes(version) || catalog.versions?.includes(version);
+    hint.textContent = compatible
+      ? `${software} lists Minecraft ${version} as compatible. A backup is created before applying the change.`
+      : `${software} does not list Minecraft ${version} as supported. Installation may be rejected by the provider.`;
+  } catch (error) {
+    if (request !== runtimeCompatibilityRequest) return;
+    hint.textContent = `Could not check the ${software} catalogue: ${error.message}`;
+  }
+}
+
+function updateAdminActionFields() {
+  const form = $('#admin-command-form');
+  if (!form) return;
+  const action = form.elements.action.value;
+  const visibleFields = new Set();
+  const descriptions = {
+    list: 'Shows the players currently connected to this server.',
+    ban: 'Permanently blocks the named player from joining. Add a reason if helpful.',
+    pardon: 'Removes a player from the ban list.',
+    'ban-ip': 'Blocks a player name or IP address from joining.',
+    'whitelist.list': 'Shows players currently allowed by the whitelist.',
+    'whitelist.add': 'Allows a player to join when the whitelist is enabled.',
+    'whitelist.remove': 'Removes a player from the whitelist.',
+    'whitelist.on': 'Only whitelisted players will be able to join.',
+    'whitelist.off': 'Allows any player to join, subject to bans and server settings.',
+    op: 'Grants a player server operator permissions.',
+    deop: 'Removes a player’s server operator permissions.',
+    'save-all': 'Saves the current world to disk.',
+    difficulty: 'Choose one of Minecraft’s four difficulty levels.',
+    time: 'Set a named time of day or advance the world by a number of ticks.',
+    weather: 'Choose the weather. Duration is optional and measured in seconds.',
+    'datapack.list': 'Lists all datapacks, or filters to available or enabled packs.',
+    'datapack.enable': 'Enables an installed datapack by its ID or name.',
+    'datapack.disable': 'Disables an enabled datapack by its ID or name.'
+  };
+  if (['ban', 'pardon', 'ban-ip', 'whitelist.add', 'whitelist.remove', 'op', 'deop'].includes(action)) visibleFields.add('player');
+  if (['ban', 'ban-ip'].includes(action)) visibleFields.add('reason');
+  if (action === 'difficulty') visibleFields.add('difficulty');
+  if (action === 'time') {
+    visibleFields.add('time-operation');
+    visibleFields.add(form.elements.timeOperation.value === 'add' ? 'time-ticks' : 'time-value');
+  }
+  if (action === 'weather') {
+    visibleFields.add('weather');
+    visibleFields.add('duration');
+  }
+  if (action === 'datapack.list') visibleFields.add('datapack-list');
+  if (['datapack.enable', 'datapack.disable'].includes(action)) visibleFields.add('datapack-name');
+  for (const field of $$('[data-admin-field]')) {
+    field.hidden = !visibleFields.has(field.dataset.adminField);
+    const input = field.querySelector('input, select');
+    if (input) input.required = !field.hidden && !['reason', 'duration'].includes(field.dataset.adminField);
+  }
+  $('#admin-action-description').textContent = descriptions[action] ?? '';
+  $('#admin-action-result').hidden = true;
 }
 
 async function loadVersions() {
@@ -805,10 +949,12 @@ async function openAdmin(server, tab = 'overview') {
 }
 
 async function activateManageTab(tab) {
-  const allowed = new Set(['overview', 'files', 'mods', 'plugins', 'worlds', 'players', 'console', 'logs']);
+  const allowed = new Set(['overview', 'files', 'mods', 'plugins', 'worlds', 'players', 'settings', 'console', 'logs']);
   if (!allowed.has(tab)) tab = 'files';
   state.manageTab = tab;
   updateManagedContentCompatibility();
+  if (tab === 'settings') populateRuntimeSettings();
+  if (tab === 'players') updateAdminActionFields();
   for (const link of $$('[data-server-section]')) {
     link.classList.toggle('active', link.dataset.serverSection === tab);
   }
@@ -1071,6 +1217,31 @@ $('#create-form').addEventListener('submit', (event) => {
   event.preventDefault();
   void createServer(event.currentTarget);
 });
+$('#runtime-version').addEventListener('change', () => void updateRuntimeCompatibilityHint());
+$('#runtime-software').addEventListener('change', () => void updateRuntimeCompatibilityHint());
+$('#runtime-change-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const server = state.servers.find((item) => item.id === state.adminServerId);
+  if (!server) return;
+  const minecraftVersion = form.elements.minecraftVersion.value;
+  const software = form.elements.software.value;
+  if (!confirm(`Back up "${server.name}" and change it to ${software} for Minecraft ${minecraftVersion}? The world, settings, mods, and plugins will be preserved, but may not be compatible with the new runtime.`)) return;
+  const submit = form.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  try {
+    const task = await api(`/api/servers/${encodeURIComponent(server.id)}/runtime`, {
+      method: 'POST',
+      body: JSON.stringify({ minecraftVersion, software, confirmed: true })
+    });
+    toast(`Runtime change queued (${task.id.slice(0, 8)}). A backup will be created first.`);
+    await refresh();
+  } catch (error) {
+    toast(error.message, 'error');
+  } finally {
+    populateRuntimeSettings();
+  }
+});
 $('#schedule-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -1136,6 +1307,8 @@ $('#new-file-form').addEventListener('submit', async (event) => {
     toast(error.message, 'error');
   }
 });
+$('#admin-command-form').elements.action.addEventListener('change', updateAdminActionFields);
+$('#admin-command-form').elements.timeOperation.addEventListener('change', updateAdminActionFields);
 $('#admin-command-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -1148,26 +1321,33 @@ $('#admin-command-form').addEventListener('submit', async (event) => {
     args.target = form.elements.player.value.trim();
     if (form.elements.reason.value) args.reason = form.elements.reason.value.trim();
   }
-  if (action === 'difficulty') args.level = form.elements.level.value;
+  if (action === 'difficulty') args.level = form.elements.difficulty.value;
   if (action === 'time') {
-    const [operation, ...value] = form.elements.value.value.trim().split(/\s+/);
-    args.operation = operation;
-    args.value = value.join(' ');
-    if (operation === 'add') args.value = Number(args.value);
+    args.operation = form.elements.timeOperation.value;
+    args.value = args.operation === 'set'
+      ? form.elements.timePreset.value
+      : Number(form.elements.timeTicks.value);
   }
   if (action === 'weather') {
-    const [type, duration] = form.elements.level.value.trim().split(/\s+/);
-    args.type = type;
-    if (duration) args.duration = Number(duration);
+    args.type = form.elements.weatherType.value;
+    if (form.elements.duration.value) args.duration = Number(form.elements.duration.value);
   }
-  if (action === 'datapack.list' && form.elements.level.value) args.type = form.elements.level.value;
-  if (action === 'datapack.enable' || action === 'datapack.disable') args.name = form.elements.name.value.trim();
+  if (action === 'datapack.list' && form.elements.datapackList.value) args.type = form.elements.datapackList.value;
+  if (action === 'datapack.enable' || action === 'datapack.disable') args.name = form.elements.datapackName.value.trim();
   if (action === 'save-all') args.flush = false;
+  const submit = form.querySelector('button[type="submit"]');
+  const resultPanel = $('#admin-action-result');
+  submit.disabled = true;
+  resultPanel.textContent = 'Running action…';
+  resultPanel.hidden = false;
   try {
-    await api(`/api/servers/${state.adminServerId}/admin`, { method: 'POST', body: JSON.stringify({ action, args }) });
-    toast('Minecraft admin command sent.');
+    const result = await api(`/api/servers/${state.adminServerId}/admin`, { method: 'POST', body: JSON.stringify({ action, args }) });
+    const output = typeof result?.output === 'string' ? result.output : '';
+    resultPanel.textContent = output || 'Action completed. This command did not return any text.';
   } catch (error) {
-    toast(error.message, 'error');
+    resultPanel.textContent = `Action failed: ${error.message}`;
+  } finally {
+    submit.disabled = false;
   }
 });
 $('#auth-form').addEventListener('submit', async (event) => {

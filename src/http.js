@@ -261,6 +261,10 @@ async function handleApi(request, response, manager, port, auth, secure) {
     sendJson(response, 202, manager.queueTask('install', id, await readJson(request)));
     return;
   }
+  if (action === 'runtime' && method === 'POST') {
+    sendJson(response, 202, manager.queueTask('runtime-change', id, await readJson(request)));
+    return;
+  }
   if (action === 'content' && method === 'POST') {
     const body = await readJson(request);
     const taskType = body.contentType === 'modpack' ? 'modpack-install' : 'content-install';

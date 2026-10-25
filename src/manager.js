@@ -306,7 +306,7 @@ export class ServerManager {
   async install(id, options = {}) {
     requireObject(options, 'Installation review');
     if (options.confirmed !== true) throw clientError('Explicit confirmation is required before downloading a server jar.', 403);
-    const server = this.requireServer(id);
+    const server = options.serverOverride ?? this.requireServer(id);
     if (server.status === 'unknown' || server.status === 'orphaned') {
       throw clientError('Verify and stop the previous process before installing software into this instance.');
     }
@@ -385,12 +385,14 @@ export class ServerManager {
       } catch (error) {
         if (error.code !== 'EEXIST') throw error;
       }
-      await this.ensureRconConfiguration(this.db.getServer(id));
-      this.db.markServerInstalled(id, `Installed Vanilla ${server.minecraftVersion}.`, javaMajor);
+      await this.ensureRconConfiguration(server);
+      if (!options.stagingRuntime) {
+        this.db.markServerInstalled(id, `Installed Vanilla ${server.minecraftVersion}.`, javaMajor);
+      }
       options.onProgress?.(100, 'Installation complete.');
       jarCommitted = false;
       propertiesCreated = false;
-      return { installed: true, version: server.minecraftVersion };
+      return { installed: true, version: server.minecraftVersion, requiredJavaMajor: javaMajor };
     } catch (error) {
       await rm(temporaryJar, { force: true });
       if (jarCommitted) await rm(jarPath, { force: true });
@@ -420,6 +422,12 @@ export class ServerManager {
         fetchImpl: this.fetch, signal: options.signal
       });
       if (server.software === 'fabric' || server.software === 'quilt') {
+        if (!catalog.minecraftVersions.includes(server.minecraftVersion)) {
+          throw clientError(
+            `${server.software === 'fabric' ? 'Fabric' : 'Quilt'} does not support Minecraft ${server.minecraftVersion}. Choose Vanilla or a server software that supports this version.`,
+            422
+          );
+        }
         const loader = catalog.loaders.find((entry) => entry.stable) ?? catalog.loaders[0];
         const installer = catalog.installers.find((entry) => entry.stable) ?? catalog.installers[0];
         if (!loader || !installer) throw clientError(`No ${server.software} loader installer is published.`, 422);
@@ -491,13 +499,21 @@ export class ServerManager {
         installedPaths.push(eulaPath);
       }
       await this.ensureRconConfiguration(server);
-      this.db.updateServer(server.id, {
-        software_version: softwareVersion,
-        loader_version: loaderVersion
-      });
-      this.db.markServerInstalled(server.id, `Installed ${server.software} for Minecraft ${server.minecraftVersion}.`, info.requiredJavaMajor);
+      if (!options.stagingRuntime) {
+        this.db.updateServer(server.id, {
+          software_version: softwareVersion,
+          loader_version: loaderVersion
+        });
+        this.db.markServerInstalled(server.id, `Installed ${server.software} for Minecraft ${server.minecraftVersion}.`, info.requiredJavaMajor);
+      }
       options.onProgress?.(100, 'Provider installation complete.');
-      return { installed: true, software: server.software, version: softwareVersion };
+      return {
+        installed: true,
+        software: server.software,
+        version: softwareVersion,
+        loaderVersion,
+        requiredJavaMajor: info.requiredJavaMajor
+      };
     } catch (error) {
       for (const filename of installedPaths.reverse()) {
         await rm(filename, { recursive: false, force: true }).catch((cleanupError) => {
@@ -608,20 +624,23 @@ export class ServerManager {
 
   queueTask(type, serverId, input = {}) {
     requireObject(input, 'Task options');
-    if (!['install', 'backup', 'restore', 'content-install', 'modpack-install'].includes(type)) throw clientError('Unsupported background task.');
+    if (!['install', 'backup', 'restore', 'content-install', 'modpack-install', 'runtime-change'].includes(type)) throw clientError('Unsupported background task.');
     if (['install', 'content-install', 'modpack-install'].includes(type) && input.confirmed !== true) throw clientError('Explicit confirmation is required before downloading server software or content.', 403);
-    if (type === 'restore' && input.confirmed !== true) throw clientError('Explicit confirmation is required before replacing server files.', 403);
+    if (['restore', 'runtime-change'].includes(type) && input.confirmed !== true) throw clientError('Explicit confirmation is required before replacing server files or software.', 403);
     const server = this.requireServer(serverId);
-    if (['install', 'backup', 'restore', 'content-install', 'modpack-install'].includes(type) && this.db.listTasks(1000).some((task) =>
+    if (['install', 'backup', 'restore', 'content-install', 'modpack-install', 'runtime-change'].includes(type) && this.db.listTasks(1000).some((task) =>
       task.serverId === serverId && ['queued', 'running', 'cancelling'].includes(task.status))) {
       throw clientError('Another background operation is already active for this server.', 409);
     }
     if (['content-install', 'modpack-install'].includes(type) && !server.installed) {
       throw clientError('Install the server software before adding content.');
     }
-    if (['install', 'backup', 'restore', 'content-install', 'modpack-install'].includes(type)
+    if (['install', 'backup', 'restore', 'content-install', 'modpack-install', 'runtime-change'].includes(type)
         && (this.runtime.has(serverId) || !['stopped', 'crashed'].includes(server.status))) {
       throw clientError('Stop and verify the server before this operation.');
+    }
+    if (type === 'runtime-change' && !server.installed) {
+      throw clientError('Install the server before changing its version or software.');
     }
     const taskId = randomUUID();
     const task = this.db.createTask({ id: taskId, type, serverId, createdAt: new Date().toISOString() });
@@ -667,8 +686,13 @@ export class ServerManager {
             signal: controller.signal,
             onProgress: (progress, message) => this.db.updateTask(taskId, { progress, message })
           });
-        } else {
+        } else if (task.type === 'modpack-install') {
           result = await this.installModrinthPack(task.serverId, input, {
+            signal: controller.signal,
+            onProgress: (progress, message) => this.db.updateTask(taskId, { progress, message })
+          });
+        } else {
+          result = await this.changeServerRuntime(task.serverId, input, {
             signal: controller.signal,
             onProgress: (progress, message) => this.db.updateTask(taskId, { progress, message })
           });
@@ -677,7 +701,7 @@ export class ServerManager {
       this.db.updateTask(taskId, {
         status: 'completed',
         progress: 100,
-        message: 'Operation completed.',
+        message: result?.message || 'Operation completed.',
         result_json: JSON.stringify(result),
         error: null
       });
@@ -710,6 +734,108 @@ export class ServerManager {
     const task = this.db.getTask(id);
     if (!task) throw clientError('Task not found.', 404);
     return task;
+  }
+
+  async changeServerRuntime(serverId, input, options = {}) {
+    requireObject(input, 'Server runtime');
+    if (input.confirmed !== true) throw clientError('Explicit confirmation is required before changing server software.', 403);
+    const server = this.requireServer(serverId);
+    this.assertServerFilesStopped(server);
+    if (!server.installed || !['stopped', 'crashed'].includes(server.status)) {
+      throw clientError('An installed, stopped server is required to change its version or software.');
+    }
+    const minecraftVersion = validateMinecraftVersion(input.minecraftVersion);
+    const software = input.software;
+    if (typeof software !== 'string' || !SERVER_SOFTWARE.has(software)) {
+      throw clientError('Choose supported server software.');
+    }
+    if (software === server.software && minecraftVersion === server.minecraftVersion) {
+      throw clientError('Choose a different Minecraft version or server software.');
+    }
+    checkCancelled(options.signal);
+    options.onProgress?.(5, 'Creating a full recovery backup before changing the server runtime.');
+    const backup = await this.createBackup(serverId, { signal: options.signal });
+    const staging = `${server.directory}.runtime-stage-${randomUUID()}`;
+    const previousRuntime = `${server.directory}.runtime-previous-${randomUUID()}`;
+    let oldMoved = false;
+    let newMoved = false;
+    let metadataUpdated = false;
+    try {
+      options.onProgress?.(15, 'Preparing a staged copy while preserving worlds, settings, and content.');
+      await copyDirectory(server.directory, staging, options.signal);
+      await removeServerRuntime(staging);
+      const target = {
+        ...server,
+        minecraftVersion,
+        software,
+        softwareVersion: null,
+        loaderVersion: null,
+        directory: staging,
+        installed: false
+      };
+      options.onProgress?.(25, `Installing ${software} for Minecraft ${minecraftVersion}.`);
+      const installed = await this.install(serverId, {
+        confirmed: true,
+        serverOverride: target,
+        stagingRuntime: true,
+        signal: options.signal,
+        onProgress: (progress, message) => options.onProgress?.(
+          25 + Math.floor(progress * 0.6),
+          message
+        )
+      });
+      checkCancelled(options.signal);
+      options.onProgress?.(90, 'Switching to the new server runtime.');
+      await rename(server.directory, previousRuntime);
+      oldMoved = true;
+      try {
+        await rename(staging, server.directory);
+        newMoved = true;
+      } catch (error) {
+        await rename(previousRuntime, server.directory);
+        oldMoved = false;
+        throw error;
+      }
+      this.db.updateServer(serverId, {
+        minecraft_version: minecraftVersion,
+        software,
+        software_version: installed.version ?? null,
+        loader_version: installed.loaderVersion ?? null,
+        required_java_major: installed.requiredJavaMajor ?? null,
+        installed: 1,
+        error: null
+      });
+      metadataUpdated = true;
+      this.db.addEvent(serverId, 'success',
+        `Changed server runtime to ${software} Minecraft ${minecraftVersion}. Recovery backup ${backup.id} was created; world, configuration, and content files were preserved.`);
+      let message = 'Server runtime change completed.';
+      try {
+        await rm(previousRuntime, { recursive: true, force: true });
+      } catch (error) {
+        message = `Server runtime change completed, but the previous runtime files could not be removed: ${safeMessage(error)}`;
+      }
+      oldMoved = false;
+      options.onProgress?.(100, 'Server runtime change complete.');
+      return { changed: true, minecraftVersion, software, backupId: backup.id, message };
+    } catch (error) {
+      if (metadataUpdated) {
+        this.db.updateServer(serverId, {
+          minecraft_version: server.minecraftVersion,
+          software: server.software,
+          software_version: server.softwareVersion ?? null,
+          loader_version: server.loaderVersion ?? null,
+          required_java_major: server.requiredJavaMajor ?? null,
+          installed: server.installed ? 1 : 0,
+          error: server.error ?? null
+        });
+      }
+      if (newMoved) await rm(server.directory, { recursive: true, force: true });
+      if (oldMoved) await rename(previousRuntime, server.directory);
+      await rm(staging, { recursive: true, force: true });
+      this.db.addEvent(serverId, 'error',
+        `Server runtime change failed; the previous installation was preserved. Recovery backup: ${backup.id}. ${safeMessage(error)}`);
+      throw error;
+    }
   }
 
   createSchedule(serverId, input) {
@@ -1200,10 +1326,21 @@ export class ServerManager {
     }
   }
 
-  sendAdminCommand(id, action, args) {
+  async sendAdminCommand(id, action, args) {
     const server = this.requireServer(id);
     if (!['running', 'orphaned'].includes(server.status)) throw clientError('The server must be running to execute Minecraft administration commands.');
-    const executor = createAdminExecutor((command) => this.sendCommand(id, command));
+    const runtime = this.runtime.get(id);
+    const executor = createAdminExecutor(async (command) => {
+      if (!runtime?.rconPassword) return this.sendCommand(id, command);
+      const output = await rconCommand({
+        host: '127.0.0.1',
+        port: server.rconPort,
+        password: runtime.rconPassword,
+        command
+      });
+      if (output) this.db.addEvent(id, 'console', output.slice(0, 1000));
+      return { sent: true, output };
+    });
     return executor(action, args);
   }
 
@@ -1744,6 +1881,30 @@ async function copyDirectory(source, destination, signal) {
     if (entry.isDirectory()) await copyDirectory(from, to, signal);
     else if (entry.isFile()) {
       await pipeline(createReadStream(from), createWriteStream(to, { flags: 'wx', mode: 0o600 }), ...(signal ? [{ signal }] : []));
+    }
+  }
+}
+
+async function removeServerRuntime(directory) {
+  const runtimePaths = [
+    'server.jar',
+    'fabric-server-launch.jar',
+    'quilt-server-launch.jar',
+    'libraries',
+    'run.sh',
+    'run.bat',
+    'user_jvm_args.txt',
+    'unix_args.txt',
+    'win_args.txt'
+  ];
+  for (const name of runtimePaths) {
+    const filename = path.join(directory, name);
+    try {
+      const info = await lstat(filename);
+      if (info.isSymbolicLink()) throw clientError(`Refusing to replace symbolic link "${name}".`);
+      await rm(filename, { recursive: info.isDirectory(), force: false });
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
     }
   }
 }

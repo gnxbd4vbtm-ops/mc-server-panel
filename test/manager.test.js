@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer as createNetServer } from 'node:net';
 import { createHash } from 'node:crypto';
-import { chmod, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -281,7 +281,9 @@ test('downloads only a Mojang-hosted jar and verifies its official SHA-1 and siz
   });
 
   await assert.rejects(manager.install(server.id), /Explicit confirmation/);
-  assert.deepEqual(await manager.install(server.id, { confirmed: true }), { installed: true, version: '1.21.8' });
+  assert.deepEqual(await manager.install(server.id, { confirmed: true }), {
+    installed: true, version: '1.21.8', requiredJavaMajor: 21
+  });
   const directory = manager.requireServer(server.id).directory;
   assert.equal((await readFile(path.join(directory, 'server.jar'))).toString(), jar.toString());
   assert.match(await readFile(path.join(directory, 'server.properties'), 'utf8'), /server-port=/);
@@ -328,7 +330,7 @@ test('installs a checksum-verified Paper server from official metadata', async (
   assert.equal((await stat(path.join(database.getServer(server.id).directory, 'server.properties'))).mode & 0o777, 0o600);
 });
 
-test('attempts a checksum-verified Fabric install when the game version is absent from its catalog', async () => {
+test('installs Fabric for a Minecraft version listed in the Fabric game catalog', async () => {
   const { root, manager, database } = await makeManager();
   const executable = path.join(root, 'fake-fabric-java');
   await writeFile(executable, `#!/bin/sh
@@ -350,7 +352,7 @@ exit 1
     const url = String(value);
     if (url.endsWith('version_manifest_v2.json')) return Response.json({ versions: [release] });
     if (url === release.url) return Response.json({ javaVersion: { majorVersion: 21 } });
-    if (url === 'https://meta.fabricmc.net/v2/versions/game') return Response.json([{ version: '1.20.6' }]);
+    if (url === 'https://meta.fabricmc.net/v2/versions/game') return Response.json([{ version: '1.20.6' }, { version: '1.21.8' }]);
     if (url === 'https://meta.fabricmc.net/v2/versions/loader') return Response.json([{ version: '0.17.2', stable: true }]);
     if (url === 'https://meta.fabricmc.net/v2/versions/installer') return Response.json([{
       version: '1.0.1', stable: true, maven: 'net.fabricmc:fabric-installer:1.0.1'
@@ -382,6 +384,43 @@ exit 1
   assert.equal(await readFile(path.join(serverDirectory, 'invoked-launch.txt'), 'utf8'),
     path.join(serverDirectory, 'fabric-server-launch.jar'));
   assert.deepEqual((await readdir(manager.serverDir)).filter((name) => name.startsWith('.provider-stage-')), []);
+});
+
+test('rejects Fabric versions absent from its game catalog before downloading the installer', async () => {
+  const { root, manager } = await makeManager();
+  const executable = await fakeJava(root, 'fabric-legacy-java', '21.0.0');
+  const release = { id: 'rd-132211', url: 'https://piston-meta.mojang.com/rd-132211.json' };
+  const requested = [];
+  manager.fetch = async (value) => {
+    const url = String(value);
+    requested.push(url);
+    if (url.endsWith('version_manifest_v2.json')) return Response.json({ versions: [release] });
+    if (url === release.url) return Response.json({ javaVersion: { majorVersion: 21 } });
+    if (url === 'https://meta.fabricmc.net/v2/versions/game') {
+      return Response.json([{ version: '1.21.8' }]);
+    }
+    if (url === 'https://meta.fabricmc.net/v2/versions/loader') {
+      return Response.json([{ version: '0.17.2', stable: true }]);
+    }
+    if (url === 'https://meta.fabricmc.net/v2/versions/installer') {
+      return Response.json([{ version: '1.1.2', stable: true, maven: 'net.fabricmc:fabric-installer:1.1.2' }]);
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const server = await manager.createServer({
+    name: 'Unsupported Fabric legacy',
+    minecraftVersion: 'rd-132211',
+    software: 'fabric',
+    javaPath: executable,
+    port: await availablePort(),
+    memoryMb: 512
+  });
+
+  await assert.rejects(manager.install(server.id, { confirmed: true }), {
+    status: 422,
+    message: 'Fabric does not support Minecraft rd-132211. Choose Vanilla or a server software that supports this version.'
+  });
+  assert.equal(requested.some((url) => url.includes('fabric-installer')), false);
 });
 
 test('repairs Fabric installs that replaced the Minecraft server jar with the loader launcher', async () => {
@@ -734,6 +773,33 @@ test('starts a local process once, sends commands, and stops gracefully', async 
   assert.equal((await manager.getLogs(server.id)).some((entry) => entry.line.includes('Done (test)')), true);
 });
 
+test('returns administration command output from the server process', async () => {
+  const { manager, database } = await makeManager();
+  const server = await manager.createServer({
+    name: 'Admin command output',
+    minecraftVersion: '1.21.8',
+    port: await availablePort(),
+    memoryMb: 512
+  });
+  const internal = database.getServer(server.id);
+  const password = await manager.ensureRconConfiguration(internal);
+  const rconServer = await fakeRcon(internal.rconPort, password);
+  database.updateServer(server.id, { status: 'running' });
+  manager.runtime.set(server.id, {
+    child: { exitCode: null, stdin: { write: () => assert.fail('Admin commands should use RCON for their response.') } },
+    startedAt: Date.now(),
+    rconPassword: password
+  });
+
+  try {
+    const result = await manager.sendAdminCommand(server.id, 'list', {});
+    assert.match(result.output, /There are 0 of 20 players online/);
+  } finally {
+    manager.runtime.delete(server.id);
+    await new Promise((resolve, reject) => rconServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test('detects and controls a still-running server process after manager restart', async () => {
   const { root, manager, database } = await makeManager();
   const executable = await fakeJava(root, 'test-java-orphan', '21.0.0',
@@ -853,6 +919,116 @@ test('creates a stopped-server snapshot and restores it without following symlin
   await writeFile(downloaded.path, 'damaged archive');
   await assert.rejects(manager.getBackupDownload(backup.id), /SHA-256 integrity verification/);
   await assert.rejects(manager.restoreBackup(server.id, backup.id, { confirmed: true }), /SHA-256 integrity verification/);
+});
+
+test('changes an installed server runtime from a backed-up staged copy while preserving content', async () => {
+  const { root, manager, database } = await makeManager({ javaCandidates: [] });
+  const javaPath = await fakeJava(root, 'java-runtime-change');
+  const server = await manager.createServer({
+    name: 'Runtime change',
+    minecraftVersion: '1.21.8',
+    port: await availablePort(),
+    memoryMb: 512,
+    javaPath
+  });
+  const directory = database.getServer(server.id).directory;
+  const nextJar = Buffer.from('verified minecraft server jar');
+  const sha1 = createHash('sha1').update(nextJar).digest('hex');
+  await mkdir(path.join(directory, 'world'), { recursive: true });
+  await mkdir(path.join(directory, 'mods'), { recursive: true });
+  await writeFile(path.join(directory, 'server.jar'), 'old server runtime');
+  await writeFile(path.join(directory, 'world', 'level.dat'), 'preserved world');
+  await writeFile(path.join(directory, 'mods', 'example.jar'), 'preserved mod');
+  await writeFile(path.join(directory, 'server.properties'), 'motd=My server\n');
+  database.updateServer(server.id, { installed: 1, software_version: 'old-version' });
+  const metadataUrl = 'https://piston-meta.mojang.com/1.21.9.json';
+  manager.fetch = async (value) => {
+    const url = String(value);
+    if (url.endsWith('version_manifest_v2.json')) {
+      return Response.json({ versions: [{ id: '1.21.9', url: metadataUrl }] });
+    }
+    if (url === metadataUrl) {
+      return Response.json({
+        javaVersion: { majorVersion: 21 },
+        downloads: { server: {
+          url: 'https://piston-data.mojang.com/1.21.9-server.jar',
+          size: nextJar.length,
+          sha1
+        } }
+      });
+    }
+    if (url === 'https://piston-data.mojang.com/1.21.9-server.jar') return new Response(nextJar);
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const result = await manager.changeServerRuntime(server.id, {
+    confirmed: true,
+    minecraftVersion: '1.21.9',
+    software: 'vanilla'
+  });
+
+  assert.equal(result.changed, true);
+  assert.equal(result.minecraftVersion, '1.21.9');
+  assert.equal(database.getServer(server.id).minecraftVersion, '1.21.9');
+  assert.equal(database.getServer(server.id).software, 'vanilla');
+  assert.equal(database.getServer(server.id).installed, true);
+  assert.deepEqual(await readFile(path.join(directory, 'server.jar')), nextJar);
+  assert.equal(await readFile(path.join(directory, 'world', 'level.dat'), 'utf8'), 'preserved world');
+  assert.equal(await readFile(path.join(directory, 'mods', 'example.jar'), 'utf8'), 'preserved mod');
+  const properties = await readFile(path.join(directory, 'server.properties'), 'utf8');
+  assert.match(properties, /^motd=My server\n/);
+  assert.match(properties, /enable-rcon=true/);
+  assert.equal(database.listBackups(server.id).some((backup) => backup.id === result.backupId), true);
+  assert.equal((await readdir(path.dirname(directory))).some((name) => name.includes('.runtime-stage-')), false);
+});
+
+test('leaves the current runtime and metadata intact when staged runtime installation fails', async () => {
+  const { root, manager, database } = await makeManager({ javaCandidates: [] });
+  const javaPath = await fakeJava(root, 'java-runtime-change-failure');
+  const server = await manager.createServer({
+    name: 'Runtime change failure',
+    minecraftVersion: '1.21.8',
+    port: await availablePort(),
+    memoryMb: 512,
+    javaPath
+  });
+  const directory = database.getServer(server.id).directory;
+  await writeFile(path.join(directory, 'server.jar'), 'current server runtime');
+  await writeFile(path.join(directory, 'preserved.txt'), 'user data');
+  database.updateServer(server.id, { installed: 1, software_version: 'current-version' });
+  const metadataUrl = 'https://piston-meta.mojang.com/1.21.9.json';
+  manager.fetch = async (value) => {
+    const url = String(value);
+    if (url.endsWith('version_manifest_v2.json')) {
+      return Response.json({ versions: [{ id: '1.21.9', url: metadataUrl }] });
+    }
+    if (url === metadataUrl) {
+      return Response.json({
+        javaVersion: { majorVersion: 21 },
+        downloads: { server: {
+          url: 'https://piston-data.mojang.com/1.21.9-server.jar',
+          size: 10,
+          sha1: '0'.repeat(40)
+        } }
+      });
+    }
+    if (url === 'https://piston-data.mojang.com/1.21.9-server.jar') return new Response('bad jar');
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  await assert.rejects(manager.changeServerRuntime(server.id, {
+    confirmed: true,
+    minecraftVersion: '1.21.9',
+    software: 'vanilla'
+  }), /unexpected size/);
+
+  assert.equal(database.getServer(server.id).minecraftVersion, '1.21.8');
+  assert.equal(database.getServer(server.id).software, 'vanilla');
+  assert.equal(database.getServer(server.id).softwareVersion, 'current-version');
+  assert.equal(await readFile(path.join(directory, 'server.jar'), 'utf8'), 'current server runtime');
+  assert.equal(await readFile(path.join(directory, 'preserved.txt'), 'utf8'), 'user data');
+  assert.equal(database.listBackups(server.id).length, 1);
+  assert.equal((await readdir(path.dirname(directory))).some((name) => name.includes('.runtime-stage-')), false);
 });
 
 async function waitFor(predicate, timeout = 2500) {
