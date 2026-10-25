@@ -3,14 +3,214 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark light">
-    <meta name="theme-color" content="#101218">
-    <title>Byte Server Panel — Minecraft Server Panel</title>
+    <meta name="theme-color" content="#10151c">
+    <meta name="description" content="Manage Minecraft Java servers on your own machine.">
+    <title>Byte Server Panel</title>
     <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
   </head>
   <body>
-    <div id="app"><div class="boot"><span class="mark">B</span><span>Starting Byte Server Panel…</span></div></div>
-    <div id="toast-area" aria-live="polite"></div>
-    <script type="module" src="/app.js"></script>
+    <section id="auth-screen" class="auth-screen" hidden aria-labelledby="auth-title">
+      <form id="auth-form" class="auth-card">
+        <a class="brand" href="/" aria-label="Byte Server Panel home">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+          <span class="brand-copy"><strong>BYTE</strong><small>SERVER PANEL</small></span>
+        </a>
+        <div class="eyebrow">SECURE PANEL ACCESS</div>
+        <h1 id="auth-title">Sign in</h1>
+        <p id="auth-description">Enter the administrator password to continue.</p>
+        <label id="setup-token-field" class="field hidden">One-time setup token<input name="token" autocomplete="one-time-code" maxlength="128"></label>
+        <label id="auth-password-field" class="field">Administrator password<input name="password" type="password" required minlength="12" maxlength="256" autocomplete="current-password"></label>
+        <div id="auth-confirm-field" class="field hidden"><label class="field">Confirm password<input name="confirmPassword" type="password" minlength="12" maxlength="256" autocomplete="new-password"></label></div>
+        <div id="auth-error" class="form-error hidden" role="alert"></div>
+        <button id="auth-submit" class="button button-primary" type="submit">Sign in</button>
+        <small class="auth-security-note">Panel access is protected by an administrator password. LAN mode requires HTTPS.</small>
+      </form>
+    </section>
+    <div id="app-shell" class="app-shell" hidden>
+      <aside class="sidebar" aria-label="Main navigation">
+        <a class="brand" href="/" aria-label="Byte Server Panel home">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+          <span class="brand-copy"><strong>BYTE</strong><small>SERVER PANEL</small></span>
+        </a>
+        <div class="sidebar-label">Workspace</div>
+        <nav class="navigation">
+          <a href="#overview" data-page="overview" class="nav-item active" title="Overview"><span class="nav-icon">◫</span>Overview</a>
+          <a href="#servers" data-page="servers" class="nav-item" title="Servers"><span class="nav-icon">▤</span>Servers <span id="nav-server-count" class="nav-count">0</span></a>
+          <a href="#catalog" data-page="catalog" class="nav-item" title="Software catalog"><span class="nav-icon">◈</span>Software catalog</a>
+          <a href="#backups" data-page="backups" class="nav-item" title="Backups"><span class="nav-icon">▧</span>Backups</a>
+          <a href="#scheduler" data-page="scheduler" class="nav-item" title="Schedules and metrics"><span class="nav-icon">◴</span>Schedules & metrics</a>
+          <a href="#activity" data-page="activity" class="nav-item" title="Activity"><span class="nav-icon">◷</span>Activity</a>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="local-card"><span class="local-dot"></span><div><strong>Protected access</strong><small>Administrator session active</small></div></div>
+          <button id="auth-logout" class="theme-toggle" type="button"><span>↪</span> Sign out</button>
+          <button id="theme-toggle" class="theme-toggle" type="button"><span>◐</span> Switch appearance</button>
+          <div class="sidebar-version">BYTE SERVER PANEL <span>v0.1.0</span></div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>Byte Server Panel</span><span class="crumb-separator">/</span><strong id="breadcrumb-current">Overview</strong></div>
+          <div class="topbar-actions">
+            <span class="system-indicator"><span class="status-dot"></span>Panel online</span>
+            <button id="quick-create" class="button button-primary button-small" type="button"><span>＋</span> New server</button>
+            <span class="avatar" aria-label="Local administrator">B</span>
+          </div>
+        </header>
+
+        <section id="page-overview" class="page active" aria-labelledby="page-title">
+          <div class="page-heading">
+            <div><div class="eyebrow">YOUR INFRASTRUCTURE</div><h1 id="page-title">Overview</h1><p class="page-description">A live view of the Minecraft servers managed on this machine.</p></div>
+            <button class="button button-secondary" type="button" data-refresh>↻ <span>Refresh</span></button>
+          </div>
+          <div id="load-error" class="notice notice-error hidden" role="alert"></div>
+          <div id="task-list" class="task-list"></div>
+          <div class="stat-grid">
+            <article class="stat-card"><div class="stat-top"><span>Total servers</span><span class="stat-icon icon-blue">▤</span></div><strong id="stat-total">—</strong><small>Managed instances</small></article>
+            <article class="stat-card"><div class="stat-top"><span>Running</span><span class="stat-icon icon-green">▶</span></div><strong id="stat-running">—</strong><small>Active processes</small></article>
+            <article class="stat-card"><div class="stat-top"><span>Starting</span><span class="stat-icon icon-blue">◌</span></div><strong id="stat-starting">—</strong><small>Starting processes</small></article>
+            <article class="stat-card"><div class="stat-top"><span>Stopped</span><span class="stat-icon icon-gray">■</span></div><strong id="stat-stopped">—</strong><small>Not running</small></article>
+            <article class="stat-card"><div class="stat-top"><span>Needs attention</span><span class="stat-icon icon-purple">!</span></div><strong id="stat-attention">—</strong><small>Crashes or detached processes</small></article>
+            <article class="stat-card"><div class="stat-top"><span>Disk used</span><span class="stat-icon icon-purple">◫</span></div><strong id="stat-disk">—</strong><small>Managed server files</small></article>
+          </div>
+          <div class="section-heading"><div><h2>Your servers</h2><p>Install, launch, and monitor each instance.</p></div><a class="text-link" href="#servers" data-page="servers">All servers <span>→</span></a></div>
+          <div id="server-grid" class="server-grid"></div>
+          <div class="section-heading"><div><h2>Historical resource metrics</h2><p>One-minute samples retained for up to 30 days; unsupported or unavailable values are shown as —.</p></div></div>
+          <div id="metrics-list" class="event-list"></div>
+          <div class="section-heading recent-heading"><div><h2>Recent activity</h2><p>Events reported by the panel and managed processes.</p></div><a class="text-link" href="#activity" data-page="activity">View activity <span>→</span></a></div>
+          <div id="overview-events" class="event-list"></div>
+        </section>
+
+        <section id="page-servers" class="page" aria-labelledby="servers-title">
+          <div class="page-heading">
+            <div><div class="eyebrow">INSTANCE MANAGEMENT</div><h1 id="servers-title">Servers</h1><p class="page-description">Create and manage independent Minecraft Java server instances.</p></div>
+            <button class="button button-primary" type="button" data-create>＋ Create server</button>
+          </div>
+          <div class="toolbar"><label class="search-field"><span>⌕</span><input id="server-search" type="search" placeholder="Search servers" aria-label="Search servers"></label><select id="server-filter" aria-label="Filter by status"><option value="all">All statuses</option><option value="running">Running</option><option value="starting">Starting</option><option value="stopped">Stopped</option><option value="crashed">Crashed</option><option value="unknown">Needs process check</option></select></div>
+          <div id="server-list" class="server-list"></div>
+        </section>
+
+        <section id="page-catalog" class="page" aria-labelledby="catalog-title">
+          <div class="page-heading"><div><div class="eyebrow">SOFTWARE</div><h1 id="catalog-title">Software catalog</h1><p class="page-description">Choose a Minecraft Java version before installing a server.</p></div><button id="catalog-refresh" class="button button-secondary" type="button">↻ Refresh catalog</button></div>
+          <div class="catalog-callout"><span class="callout-icon">◈</span><div><strong>Verified provider catalog</strong><p>Vanilla versions come from Mojang. Paper, Purpur, Fabric, Forge, NeoForge, and Quilt artifacts are resolved from their official provider catalogs and checksum-verified before installation.</p></div></div>
+          <div class="toolbar"><label class="search-field"><span>⌕</span><input id="version-search" type="search" placeholder="Filter versions" aria-label="Filter Minecraft versions"></label><span id="version-count" class="muted"></span></div>
+          <div id="version-list" class="version-list"></div>
+          <div class="section-heading"><div><h2>Modrinth content</h2><p>Discover compatible mods, plugins, and server-ready modpacks. Files are verified against Modrinth hashes before installation.</p></div></div>
+          <form id="modrinth-search-form" class="schedule-form">
+            <label class="field">Server<select id="modrinth-server" required></select></label>
+            <label class="field">Content type<select id="modrinth-type"><option value="mod">Mods</option><option value="plugin">Plugins</option><option value="modpack">Modpacks</option></select></label>
+            <label class="field">Search<input id="modrinth-query" maxlength="200" placeholder="Search Modrinth"></label>
+            <button class="button button-primary" type="submit">Search</button>
+          </form>
+          <div id="modrinth-results" class="version-list"></div>
+        </section>
+
+        <section id="page-backups" class="page" aria-labelledby="backups-title">
+          <div class="page-heading"><div><div class="eyebrow">RECOVERY</div><h1 id="backups-title">Backups</h1><p class="page-description">Stopped-server snapshots stored on this machine.</p></div></div>
+          <div class="catalog-callout"><span class="callout-icon">ⓘ</span><div><strong>Consistency matters</strong><p>Archives are created only when a server is stopped. They are compressed, integrity-checked, portable local backups; restoring replaces the selected server files.</p></div></div>
+          <div id="backup-list" class="backup-list"></div>
+        </section>
+
+        <section id="page-scheduler" class="page" aria-labelledby="scheduler-title">
+          <div class="page-heading"><div><div class="eyebrow">AUTOMATION</div><h1 id="scheduler-title">Schedules & metrics</h1><p class="page-description">Recurring actions run only while the panel is online. Missed runs are skipped after downtime.</p></div><a id="diagnostics-download" class="button button-secondary" href="/api/diagnostics" download>Export diagnostics</a></div>
+          <div class="catalog-callout"><span class="callout-icon">◴</span><div><strong>Persistent interval schedules</strong><p>Choose a server action and interval. Starts still require prior EULA acceptance. Backups are queued and will run only when the server is stopped.</p></div></div>
+          <form id="schedule-form" class="schedule-form">
+            <label class="field">Server<select name="serverId" id="schedule-server" required></select></label>
+            <label class="field">Action<select name="action" required><option value="backup">Backup</option><option value="restart">Restart</option><option value="start">Start</option><option value="stop">Stop</option></select></label>
+            <label class="field">Interval (minutes)<input type="number" name="intervalMinutes" min="5" max="43200" step="5" value="60" required></label>
+            <button class="button button-primary" type="submit">Add schedule</button>
+          </form>
+          <div id="schedule-list" class="backup-list"></div>
+          <div class="section-heading"><div><h2>Resource history</h2><p>Collected on this host from managed server processes and instance directories.</p></div></div>
+          <div id="scheduler-metrics-list" class="event-list"></div>
+        </section>
+
+        <section id="page-activity" class="page" aria-labelledby="activity-title">
+          <div class="page-heading"><div><div class="eyebrow">AUDIT TRAIL</div><h1 id="activity-title">Activity</h1><p class="page-description">Recent events reported by the panel and server processes.</p></div><button class="button button-secondary" type="button" data-refresh>↻ <span>Refresh</span></button></div>
+          <div id="activity-list" class="event-list event-list-full"></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="create-dialog" class="dialog">
+      <form id="create-form" class="dialog-content">
+        <div class="dialog-top"><div><div class="eyebrow">NEW INSTANCE</div><h2>Create a server</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close">×</button></div>
+        <p class="dialog-intro">Configure a local Minecraft Java server. Creation stores configuration only; software installation starts after you review and confirm the download.</p>
+        <div class="form-grid">
+          <label class="field field-wide">Server name<input name="name" required minlength="2" maxlength="48" placeholder="e.g. Survival" autocomplete="off"></label>
+          <label class="field field-wide">Description <span class="optional">Optional</span><input name="description" maxlength="500" placeholder="A short note about this server"></label>
+          <label class="field">Minecraft version<input name="minecraftVersion" id="create-version" required value="1.21.8" list="minecraft-versions" placeholder="1.21.8"><datalist id="minecraft-versions"></datalist><small id="version-hint">Enter a version identifier; Java requirements are checked against Mojang metadata.</small></label>
+          <label class="field">Software<select name="software" id="create-software"><option value="vanilla">Vanilla</option><option value="fabric">Fabric</option><option value="forge">Forge</option><option value="neoforge">NeoForge</option><option value="quilt">Quilt</option><option value="paper">Paper</option><option value="purpur">Purpur</option></select><small id="provider-catalog-hint">Loaders and server jars are resolved from their official catalogs.</small></label>
+          <label class="field">Maximum heap memory (MB)<input name="memoryMb" type="number" min="512" step="256" value="2048" required><small>Available host memory is checked before saving.</small></label>
+          <label class="field">Server port<input name="port" type="number" min="1024" max="65535" value="25565" required></label>
+          <label class="field field-wide">Detected Java runtimes<select id="java-runtime-select"><option value="">Loading detected runtimes…</option></select><small id="java-runtime-hint">Detected executables are probed locally; Java is never installed or changed by the panel.</small></label>
+          <label class="field field-wide">Java executable<input name="javaPath" id="java-path" value="java" required maxlength="512"><small>Selected runtime path, executable name on PATH, or a full executable path.</small></label>
+        </div>
+        <div class="review-note"><span>✓</span><div><strong>Review before installing</strong><small>The panel will download one verified server jar from Mojang into a new, isolated instance directory. You must accept the Minecraft EULA before the first start.</small></div></div>
+        <div id="create-error" class="form-error hidden" role="alert"></div>
+        <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Create instance</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="admin-dialog" class="dialog dialog-wide">
+      <div class="dialog-content">
+        <div class="dialog-top"><div><div class="eyebrow">SERVER ADMINISTRATION</div><h2 id="admin-title">Manage server</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close">×</button></div>
+        <nav class="manage-tabs" aria-label="Server sections" role="tablist">
+          <button class="manage-tab active" type="button" role="tab" aria-selected="true" aria-controls="manage-files" data-manage-tab="files">Files</button>
+          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-mods" data-manage-tab="mods">Mods</button>
+          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-plugins" data-manage-tab="plugins">Plugins</button>
+          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-worlds" data-manage-tab="worlds">Worlds</button>
+          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-console" data-manage-tab="console">Console</button>
+          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-logs" data-manage-tab="logs">Logs</button>
+        </nav>
+        <section id="manage-files" class="manage-panel active" role="tabpanel">
+          <h3>Server files</h3>
+          <div class="file-toolbar"><button id="file-up" class="button button-secondary button-small" type="button">Up</button><span id="file-path-label">/</span><button id="file-reload" class="button button-secondary button-small" type="button">Refresh</button></div><div id="file-list" class="file-list"></div>
+          <form id="new-file-form" class="file-create"><input name="filename" required maxlength="255" placeholder="New text filename"><button class="button button-secondary button-small" type="submit">Create</button></form>
+          <label class="field">Selected text file<textarea id="file-editor" rows="12" spellcheck="false" maxlength="2097152" disabled></textarea></label>
+          <div class="card-actions"><button id="file-save" class="button button-primary button-small" type="button" disabled>Save file</button><button id="file-delete" class="button button-danger button-small" type="button" disabled>Delete file</button></div>
+          <small>File changes require a stopped server. Binary files and symbolic links cannot be edited.</small>
+        </section>
+        <section id="manage-mods" class="manage-panel" role="tabpanel" hidden>
+          <div class="manage-section-heading"><div><h3>Mods</h3><p>Browse installed mods or find compatible projects on Modrinth.</p></div><button class="button button-secondary button-small" type="button" data-open-server-folder="mods">Open mods folder</button></div>
+          <div id="manage-mod-files" class="file-list"></div>
+          <form class="manage-search-form" data-manage-search="mod"><label class="field">Find mods on Modrinth<input name="query" maxlength="200" placeholder="Search mods"></label><button class="button button-primary button-small" type="submit">Search mods</button></form>
+          <div id="manage-mod-results" class="version-list"></div>
+        </section>
+        <section id="manage-plugins" class="manage-panel" role="tabpanel" hidden>
+          <div class="manage-section-heading"><div><h3>Plugins</h3><p>Browse installed plugins or find compatible projects on Modrinth.</p></div><button class="button button-secondary button-small" type="button" data-open-server-folder="plugins">Open plugins folder</button></div>
+          <div id="manage-plugin-files" class="file-list"></div>
+          <form class="manage-search-form" data-manage-search="plugin"><label class="field">Find plugins on Modrinth<input name="query" maxlength="200" placeholder="Search plugins"></label><button class="button button-primary button-small" type="submit">Search plugins</button></form>
+          <div id="manage-plugin-results" class="version-list"></div>
+        </section>
+        <section id="manage-worlds" class="manage-panel" role="tabpanel" hidden>
+          <div class="manage-section-heading"><div><h3>Worlds</h3><p>World folders are detected from server data. Save and stop the server before changing world files.</p></div><button id="worlds-refresh" class="button button-secondary button-small" type="button">Refresh</button></div>
+          <div id="world-list" class="server-list"></div>
+          <div class="world-admin-section"><h3>Players, world settings & datapacks</h3><form id="admin-command-form" class="admin-command-form">
+            <label class="field">Action<select name="action"><option value="ban">Ban player</option><option value="pardon">Pardon player</option><option value="ban-ip">Ban IP/player</option><option value="whitelist.add">Whitelist add</option><option value="whitelist.remove">Whitelist remove</option><option value="whitelist.list">Whitelist list</option><option value="whitelist.on">Whitelist on</option><option value="whitelist.off">Whitelist off</option><option value="op">Grant operator</option><option value="deop">Remove operator</option><option value="list">List players</option><option value="save-all">Save world</option><option value="difficulty">Set difficulty</option><option value="time">Set/add time</option><option value="weather">Set weather</option><option value="datapack.list">List datapacks</option><option value="datapack.enable">Enable datapack</option><option value="datapack.disable">Disable datapack</option></select></label>
+            <label class="field">Player / target<input name="player" maxlength="40" autocomplete="off"></label>
+            <label class="field">Reason <span class="optional">Optional</span><input name="reason" maxlength="256"></label>
+            <label class="field">Setting / datapack name<input name="name" maxlength="128"></label>
+            <label class="field">Operation/value<input name="value" maxlength="32" placeholder="set day, add 1000, night"></label>
+            <label class="field">Difficulty / weather<input name="level" maxlength="16" placeholder="normal / rain"></label>
+            <button class="button button-secondary" type="submit">Run admin action</button>
+          </form>
+          <p class="console-warning">Available only while the server is running. Commands are allowlisted and validated; results appear in Logs.</p></div>
+        </section>
+        <section id="manage-console" class="manage-panel" role="tabpanel" hidden>
+          <h3>Server console</h3><div class="console-status" id="console-status"></div>
+          <form id="console-form" class="console-form"><label class="sr-only" for="console-command">Console command</label><span class="console-prompt">›</span><input id="console-command" autocomplete="off" placeholder="Type a server command…" maxlength="256"><button class="button button-primary button-small" type="submit">Send</button></form>
+          <p class="console-warning">Console access grants server administrator privileges. Commands are sent to the running server process. Output is available in Logs.</p>
+        </section>
+        <section id="manage-logs" class="manage-panel" role="tabpanel" hidden>
+          <div class="manage-section-heading"><div><h3>Server logs</h3><p>Recent process output and server log entries.</p></div><button id="logs-refresh" class="button button-secondary button-small" type="button">Refresh</button></div>
+          <div id="console-output" class="console-output" aria-live="polite"></div>
+        </section>
+      </div>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   </body>
 </html>

@@ -1,524 +1,421 @@
-import http from "node:http";
-import https from "node:https";
-import { createReadStream } from "node:fs";
-import fsSync from "node:fs";
-import fs from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { allowedPanelHosts, host, port, secureCookies, tlsCertPath, tlsKeyPath } from "./config.js";
-import {
-  acceptEula, cancelJob, createBackup, createLiveWorldSnapshot, createServer, createServerFile, createWorldBackup, deleteServer, deleteServerFile, downloadServerFile,
-  getBackupDownload, getBackupSchedule, getLanAddresses, getLog, getPlayerRecords, getProjectVersions, getServer, getServerHistory, getServers,
-  getWorldBackupDownload, getWorlds, getJob, getModpackVersions, importWorldArchive, installModpack, listBackups, listWorldBackups, getInstalledProjects, getProject, moveServerFile, playerAction,
-  queryOnlinePlayers, readServerFiles, removeProject, resolvePlayerProfile, restoreBackup, restoreWorldBackup, rollbackProject, searchProjects, sendCommand, setBackupSchedule,
-  queueInstall, retryJob, queryServerTelemetry, searchModpacks, startServer, restartServer, setAutoRestart, stopServer, subscribe, uploadServerFile, updatePlayerRecords, writeServerFile, installProject, updateProject,
-} from "./manager.js";
-import {
-  availableJavaRuntimes, listFabricMinecraftVersions, listMinecraftVersions,
-  listForgeMinecraftVersions, listNeoForgeVersions, listPaperVersions, listPurpurVersions,
-  listQuiltMinecraftVersions, listBedrockVersions, requiredJavaForVersion,
-} from "./minecraft.js";
-import {
-  authenticate, createSession, getSession, hasPassword, invalidateOtherSessions, parseCookies, removeSession, setPassword,
-} from "./security.js";
+import { createReadStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { AuthService, getSessionToken } from './auth.js';
+import os from 'node:os';
 
-const staticRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../public");
-const loginAttempts = new Map();
-const safeMethods = new Set(["GET", "HEAD", "OPTIONS"]);
-
-function sendJson(response, status, value, headers = {}) {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers });
-  response.end(JSON.stringify(value));
+const publicDir = path.resolve(fileURLToPath(new URL('../public/', import.meta.url)));
+const MIME_TYPES = new Map([
+  ['.css', 'text/css; charset=utf-8'],
+  ['.html', 'text/html; charset=utf-8'],
+  ['.ico', 'image/x-icon'],
+  ['.js', 'text/javascript; charset=utf-8'],
+  ['.json', 'application/json; charset=utf-8'],
+  ['.svg', 'image/svg+xml']
+]);
+export function createHttpServer(manager, { host, port, tls, allowedHosts = [] }, auth = new AuthService(manager.db)) {
+  const server = tls
+    ? createHttpsServer(tls, requestHandler(manager, { host, port, tls, allowedHosts }, auth))
+    : createServer(requestHandler(manager, { host, port, tls, allowedHosts }, auth));
+  return server.listen(port, host);
 }
 
-function streamFile(response, filename) {
-  const stream = createReadStream(filename);
-  stream.once("error", (error) => response.destroy(error));
-  return stream.pipe(response);
-}
-
-function fail(status, message) {
-  const error = new Error(message);
-  error.status = status;
-  return error;
-}
-
-async function readJson(request) {
-  let content = "";
-  for await (const chunk of request) {
-    content += chunk;
-    if (Buffer.byteLength(content) > 1024 * 1024) throw fail(413, "Request body exceeds 1 MB");
-  }
-  try {
-    return content ? JSON.parse(content) : {};
-  } catch {
-    throw fail(400, "Request body must contain valid JSON");
-  }
-}
-
-function sessionCookie(id, maxAge) {
-  return `mc_panel_session=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secureCookies ? "; Secure" : ""}`;
-}
-
-function requireSameOrigin(request) {
-  if (safeMethods.has(request.method)) return;
-  const hostHeader = request.headers.host;
-  if (!hostHeader) throw fail(403, "Same-origin request required");
-  const origin = request.headers.origin;
-  // A same-origin fetch does not send an Origin header; only cross-origin
-  // requests do. A missing Origin therefore implies same-origin.
-  if (!origin) return;
-  let parsed;
-  try {
-    parsed = new URL(origin);
-  } catch {
-    throw fail(403, "Invalid request origin");
-  }
-  if (parsed.host !== hostHeader || !["http:", "https:"].includes(parsed.protocol)) {
-    throw fail(403, "Cross-origin request rejected");
-  }
-}
-
-function authenticateRequest(request) {
-  const cookies = parseCookies(request.headers.cookie);
-  const id = cookies.mc_panel_session;
-  const session = getSession(id);
-  if (!session) throw fail(401, "Sign in to continue");
-  if (!safeMethods.has(request.method) && request.headers["x-csrf-token"] !== session.csrf) {
-    throw fail(403, "Invalid or missing CSRF token");
-  }
-  return session;
-}
-
-async function api(request, response, url) {
-  const pathname = url.pathname;
-  if (request.method === "GET" && pathname === "/api/setup") {
-    return sendJson(response, 200, { configured: hasPassword() });
-  }
-  if (request.method === "POST" && pathname === "/api/setup") {
-    requireSameOrigin(request);
-    if (hasPassword()) throw fail(409, "Panel setup has already been completed");
-    const body = await readJson(request);
-    await setPassword(body.password);
-    const session = createSession();
-    return sendJson(response, 200, { csrf: session.csrf }, { "set-cookie": sessionCookie(session.id, 43200) });
-  }
-  if (request.method === "POST" && pathname === "/api/login") {
-    requireSameOrigin(request);
-    const address = request.socket.remoteAddress ?? "unknown";
-    const attempt = loginAttempts.get(address) ?? { count: 0, until: 0 };
-    if (attempt.until > Date.now()) throw fail(429, "Too many sign-in attempts. Try again later.");
-    const body = await readJson(request);
-    if (!await authenticate(body.password)) {
-      attempt.count++;
-      if (attempt.count >= 5) {
-        attempt.count = 0;
-        attempt.until = Date.now() + 60_000;
+function requestHandler(manager, { host, port, tls, allowedHosts }, auth) {
+  const knownHosts = new Set([
+    '127.0.0.1', 'localhost', '[::1]', '::1',
+    ...(host === '0.0.0.0' || host === '::' ? localInterfaceAddresses() : [host]),
+    ...allowedHosts
+  ]);
+  return async (request, response) => {
+    applySecurityHeaders(response, Boolean(tls));
+    try {
+      assertAllowedHost(request, port, knownHosts);
+      if (request.url?.startsWith('/api/')) {
+        await handleApi(request, response, manager, port, auth, Boolean(tls));
+      } else {
+        await serveStatic(request, response);
       }
-      loginAttempts.set(address, attempt);
-      throw fail(401, "Incorrect password");
+    } catch (error) {
+      const status = Number.isInteger(error.status) ? error.status : 500;
+      if (status >= 500) console.error(`[http] ${request.method} ${request.url}:`, error);
+      sendJson(response, status, { error: status === 500 ? 'The request could not be completed.' : error.message });
     }
-    loginAttempts.delete(address);
-    const session = createSession();
-    return sendJson(response, 200, { csrf: session.csrf }, { "set-cookie": sessionCookie(session.id, 43200) });
-  }
-  if (request.method === "GET" && pathname === "/api/session") {
-    const session = getSession(parseCookies(request.headers.cookie).mc_panel_session);
-    return sendJson(response, 200, { configured: hasPassword(), authenticated: Boolean(session), csrf: session?.csrf ?? null });
-  }
-  if (request.method === "POST" && pathname === "/api/logout") {
-    const cookies = parseCookies(request.headers.cookie);
-    authenticateRequest(request);
-    removeSession(cookies.mc_panel_session);
-    return sendJson(response, 200, { ok: true }, { "set-cookie": sessionCookie("", 0) });
-  }
+  };
+}
 
-  requireSameOrigin(request);
-  authenticateRequest(request);
+async function handleApi(request, response, manager, port, auth, secure) {
+  assertSameOrigin(request, port, request.socket.encrypted === true);
+  const url = new URL(request.url, `http://${request.headers.host}`);
+  const { pathname } = url;
+  const method = request.method ?? 'GET';
 
-  if (request.method === "POST" && pathname === "/api/password") {
-    const body = await readJson(request);
-    if (!await authenticate(body.current_password)) throw fail(401, "Current password is incorrect");
-    await setPassword(body.new_password);
-    const sessionId = parseCookies(request.headers.cookie).mc_panel_session;
-    invalidateOtherSessions(sessionId);
-    return sendJson(response, 200, { ok: true });
-  }
-
-  const jobRoute = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(retry|cancel))?$/.exec(pathname);
-  if (jobRoute && request.method === "GET" && !jobRoute[2]) {
-    return sendJson(response, 200, getJob(jobRoute[1]));
-  }
-  if (jobRoute && request.method === "POST" && jobRoute[2] === "retry") {
-    return sendJson(response, 202, retryJob(jobRoute[1]));
-  }
-  if (jobRoute && request.method === "POST" && jobRoute[2] === "cancel") {
-    return sendJson(response, 202, cancelJob(jobRoute[1]));
-  }
-
-  if (request.method === "GET" && pathname === "/api/versions") {
-    const versions = await listMinecraftVersions();
-    let bedrockVersions = [];
-    let bedrockError = null;
-    try {
-      bedrockVersions = await listBedrockVersions();
-    } catch (error) {
-      bedrockError = error.message;
-    }
-    let paperVersions = new Set();
-    let paperError = null;
-    let purpurVersions = new Set();
-    let purpurError = null;
-    let fabricVersions = new Set();
-    let fabricError = null;
-    let quiltVersions = new Set();
-    let quiltError = null;
-    let forgeVersions = new Set();
-    let forgeError = null;
-    try {
-      paperVersions = new Set(await listPaperVersions());
-    } catch (error) {
-      paperError = error.message;
-    }
-    try {
-      purpurVersions = new Set(await listPurpurVersions());
-    } catch (error) {
-      purpurError = error.message;
-    }
-    try {
-      fabricVersions = new Set(await listFabricMinecraftVersions());
-    } catch (error) {
-      fabricError = error.message;
-    }
-    try {
-      quiltVersions = new Set(await listQuiltMinecraftVersions());
-    } catch (error) {
-      quiltError = error.message;
-    }
-    try {
-      forgeVersions = new Set(await listForgeMinecraftVersions());
-    } catch (error) {
-      forgeError = error.message;
-    }
-    const neoForgeVersions = new Set();
-    let neoForgeError = null;
-    try {
-      const supported = await Promise.all(versions.filter((version) => version.type === "release")
-        .map(async (version) => [version.id, (await listNeoForgeVersions(version.id)).length > 0]));
-      for (const [version, compatible] of supported) if (compatible) neoForgeVersions.add(version);
-    } catch (error) {
-      neoForgeError = error.message;
-    }
-    return sendJson(response, 200, {
-      versions: versions.filter((version) => ["release", "snapshot"].includes(version.type))
-        .map(({ id, type, time }) => ({
-          id, type, time, paper: paperVersions.has(id), purpur: purpurVersions.has(id),
-          fabric: fabricVersions.has(id), quilt: quiltVersions.has(id),
-          forge: type === "release" && forgeVersions.has(id), neoforge: type === "release" && neoForgeVersions.has(id),
-        })),
-      bedrock_versions: bedrockVersions,
-      bedrock_available: bedrockError === null,
-      bedrock_error: bedrockError,
-      paper_available: paperError === null,
-      paper_error: paperError,
-      purpur_available: purpurError === null,
-      purpur_error: purpurError,
-      fabric_available: fabricError === null,
-      fabric_error: fabricError,
-      quilt_available: quiltError === null,
-      quilt_error: quiltError,
-      forge_available: forgeError === null,
-      forge_error: forgeError,
-      neoforge_available: neoForgeError === null,
-      neoforge_error: neoForgeError,
-    });
-  }
-  if (request.method === "GET" && pathname === "/api/java") {
-    const version = url.searchParams.get("version");
-    return sendJson(response, 200, {
-      runtimes: await availableJavaRuntimes(),
-      required_major: version ? await requiredJavaForVersion(version) : null,
-    });
-  }
-  if (request.method === "GET" && pathname === "/api/network") {
-    return sendJson(response, 200, { lan_addresses: getLanAddresses() });
-  }
-  if (request.method === "GET" && pathname === "/api/servers") return sendJson(response, 200, getServers());
-  if (request.method === "POST" && pathname === "/api/servers") {
-    return sendJson(response, 201, await createServer(await readJson(request)));
-  }
-
-  const route = /^\/api\/servers\/([a-z0-9-]+)(?:\/([a-z-]+))?$/.exec(pathname);
-  if (!route) throw fail(404, "Not found");
-  const [, id, action] = route;
-  if (request.method === "GET" && action === "modpacks") {
-    return sendJson(response, 200, await searchModpacks(id, {
-      source: url.searchParams.get("source") ?? "curseforge",
-      query: url.searchParams.get("query") ?? "",
-      limit: Number(url.searchParams.get("limit") ?? 20),
-      offset: Number(url.searchParams.get("offset") ?? 0),
-    }));
-  }
-  if (request.method === "GET" && action === "modpack-versions") {
-    return sendJson(response, 200, await getModpackVersions(id, url.searchParams.get("project_id")));
-  }
-  if (request.method === "POST" && action === "modpacks") {
-    const body = await readJson(request);
-    return sendJson(response, 200, await installModpack(id, body.project_id, body.file_id));
-  }
-  if (request.method === "GET" && action === "projects") {
-    const type = url.searchParams.get("type") ?? "mod";
-    if (url.searchParams.get("installed") === "1") return sendJson(response, 200, await getInstalledProjects(id, type));
-    return sendJson(response, 200, await searchProjects(id, {
-      source: url.searchParams.get("source") ?? "modrinth",
-      type,
-      query: url.searchParams.get("query") ?? "",
-      limit: Number(url.searchParams.get("limit") ?? 20),
-      offset: Number(url.searchParams.get("offset") ?? 0),
-    }));
-  }
-  if (request.method === "GET" && action === "project") {
-    return sendJson(response, 200, await getProject(id, url.searchParams.get("project_id"), url.searchParams.get("type") ?? "mod"));
-  }
-  if (request.method === "GET" && action === "project-versions") {
-    return sendJson(response, 200, await getProjectVersions(
-      id, url.searchParams.get("project_id"), url.searchParams.get("type") ?? "mod",
-      url.searchParams.get("source") ?? "modrinth",
-    ));
-  }
-  if (request.method === "POST" && action === "projects") {
-    const body = await readJson(request);
-    if (body.operation === "install") {
-      return sendJson(response, 200, await installProject(
-        id, body.project_id, body.version_id, body.type ?? "mod", body.source ?? "modrinth",
-      ));
-    }
-    if (body.operation === "remove") {
-      return sendJson(response, 200, await removeProject(id, body.filename, body.type ?? "mod"));
-    }
-    if (body.operation === "update") {
-      return sendJson(response, 200, await updateProject(id, body.project_id, body.type ?? "mod"));
-    }
-    if (body.operation === "rollback") {
-      return sendJson(response, 200, await rollbackProject(id, body.project_id, body.type ?? "mod"));
-    }
-    throw fail(400, "Project operation must be install, update, rollback, or remove");
-  }
-  if (request.method === "GET" && action === "players") return sendJson(response, 200, await queryOnlinePlayers(id));
-  if (request.method === "POST" && action === "telemetry") {
-    return sendJson(response, 200, await queryServerTelemetry(id));
-  }
-  if (request.method === "POST" && action === "players") {
-    const body = await readJson(request);
-    await playerAction(id, body.action, body.player, body.reason);
-    return sendJson(response, 200, { ok: true });
-  }
-  if (request.method === "GET" && action === "player-profile") {
-    return sendJson(response, 200, await resolvePlayerProfile(id, url.searchParams.get("name")));
-  }
-  if (request.method === "GET" && action === "permissions") return sendJson(response, 200, await getPlayerRecords(id));
-  if (request.method === "PUT" && action === "permissions") {
-    const body = await readJson(request);
-    return sendJson(response, 200, await updatePlayerRecords(id, body.filename, body.records));
-  }
-  if (request.method === "GET" && action === "history") return sendJson(response, 200, getServerHistory(id));
-  if (request.method === "GET" && action === "worlds") return sendJson(response, 200, await getWorlds(id));
-  if (request.method === "POST" && action === "worlds") {
-    const body = await readJson(request);
-    if (body.operation === "backup") return sendJson(response, 201, await createWorldBackup(id, body.world_name));
-    if (body.operation === "snapshot") return sendJson(response, 201, await createLiveWorldSnapshot(id, body.world_name));
-    if (body.operation === "import") {
-      return sendJson(response, 200, await importWorldArchive(id, body.archive_path, body.world_name));
-    }
-    throw fail(400, "World operation must be backup, snapshot, or import");
-  }
-  if (request.method === "GET" && action === "world-backups") return sendJson(response, 200, await listWorldBackups(id));
-  if (request.method === "POST" && action === "world-backups") {
-    const body = await readJson(request);
-    if (body.operation !== "restore") throw fail(400, "World backup operation must be restore");
-    return sendJson(response, 200, await restoreWorldBackup(id, body.backup_id));
-  }
-  if (request.method === "GET" && action === "backup-schedule") return sendJson(response, 200, getBackupSchedule(id));
-  if (request.method === "PUT" && action === "auto-restart") {
-    const body = await readJson(request);
-    return sendJson(response, 200, setAutoRestart(id, body.enabled));
-  }
-  if (request.method === "PUT" && action === "backup-schedule") {
-    const body = await readJson(request);
-    return sendJson(response, 200, setBackupSchedule(id, body.interval_hours, body.retention_count, body.enabled));
-  }
-  if (request.method === "GET" && action === "download") {
-    const file = await downloadServerFile(id, url.searchParams.get("path"));
-    response.writeHead(200, {
-      "content-type": "application/octet-stream",
-      "content-length": file.size,
-      "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.filename)}`,
-      "cache-control": "no-store",
-    });
-    return streamFile(response, file.path);
-  }
-  if (request.method === "GET" && action === "backup-download") {
-    const file = await getBackupDownload(id, url.searchParams.get("backup_id"));
-    response.writeHead(200, {
-      "content-type": "application/gzip",
-      "content-length": file.size,
-      "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.filename)}`,
-      "cache-control": "no-store",
-    });
-    return streamFile(response, file.path);
-  }
-  if (request.method === "GET" && action === "world-backup-download") {
-    const file = await getWorldBackupDownload(id, url.searchParams.get("backup_id"));
-    response.writeHead(200, {
-      "content-type": "application/gzip",
-      "content-length": file.size,
-      "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.filename)}`,
-      "cache-control": "no-store",
-    });
-    return streamFile(response, file.path);
-  }
-  if (request.method === "PUT" && action === "upload") {
-    const uploaded = await uploadServerFile(id, url.searchParams.get("path"), request);
-    return sendJson(response, 201, uploaded);
-  }
-  if (request.method === "GET" && !action) {
-    const server = getServer(id);
-    if (!server) throw fail(404, "Server not found");
-    return sendJson(response, 200, server);
-  }
-  if (request.method === "DELETE" && !action) {
-    await deleteServer(id);
-    return sendJson(response, 200, { ok: true });
-  }
-  if (request.method === "POST" && action === "install") return sendJson(response, 202, queueInstall(id));
-  if (request.method === "POST" && action === "eula") {
-    const body = await readJson(request);
-    return sendJson(response, 200, await acceptEula(id, body.accepted));
-  }
-  if (request.method === "POST" && action === "start") return sendJson(response, 200, await startServer(id));
-  if (request.method === "POST" && action === "restart") return sendJson(response, 200, await restartServer(id));
-  if (request.method === "POST" && action === "stop") {
-    const body = await readJson(request);
-    await stopServer(id, body.force === true);
-    return sendJson(response, 200, { ok: true });
-  }
-  if (request.method === "POST" && action === "command") {
-    const body = await readJson(request);
-    await sendCommand(id, body.command);
-    return sendJson(response, 200, { ok: true });
-  }
-  if (request.method === "GET" && action === "files") {
-    const relative = url.searchParams.get("path") ?? ".";
-    return sendJson(response, 200, await readServerFiles(id, relative));
-  }
-  if (request.method === "PUT" && action === "files") {
-    const body = await readJson(request);
-    await writeServerFile(id, body.path, body.content);
-    return sendJson(response, 200, { ok: true });
-  }
-  if (request.method === "POST" && action === "files") {
-    const body = await readJson(request);
-    if (body.operation === "create") {
-      await createServerFile(id, body.path, body.type);
-      return sendJson(response, 201, { ok: true });
-    }
-    if (body.operation === "move") {
-      await moveServerFile(id, body.from, body.to);
-      return sendJson(response, 200, { ok: true });
-    }
-    if (body.operation === "delete") return sendJson(response, 200, await deleteServerFile(id, body.path));
-    throw fail(400, "File operation must be create, move, or delete");
-  }
-  if (request.method === "GET" && action === "logs") {
-    if (url.searchParams.get("stream") !== "1") return sendJson(response, 200, { log: await getLog(id) });
-    response.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-      "x-accel-buffering": "no",
-    });
-    response.write(`data: ${JSON.stringify(await getLog(id))}\n\n`);
-    const unsubscribe = subscribe(id, (text) => response.write(`data: ${JSON.stringify(text)}\n\n`));
-    const keepalive = setInterval(() => response.write(": keepalive\n\n"), 20000);
-    response.on("close", () => {
-      clearInterval(keepalive);
-      unsubscribe();
+  if (pathname === '/api/auth/status' && method === 'GET') {
+    sendJson(response, 200, {
+      configured: auth.isConfigured(),
+      authenticated: auth.authenticate(getSessionToken(request))
     });
     return;
   }
-  if (request.method === "GET" && action === "backups") return sendJson(response, 200, listBackups(id));
-  if (request.method === "POST" && action === "backups") return sendJson(response, 201, await createBackup(id));
-  if (request.method === "POST" && action === "restore") {
+  if (pathname === '/api/auth/setup' && method === 'POST') {
     const body = await readJson(request);
-    await restoreBackup(id, body.backup_id);
-    return sendJson(response, 200, { ok: true });
-  }
-  throw fail(404, "Not found");
-}
-
-async function staticFile(request, response, pathname) {
-  const file = pathname === "/" ? "index.html" : pathname.slice(1);
-  if (!/^[a-zA-Z0-9._-]+$/.test(file)) throw fail(404, "Not found");
-  const target = path.join(staticRoot, file);
-  let content;
-  try {
-    content = await fs.readFile(target);
-  } catch (error) {
-    if (error.code === "ENOENT") throw fail(404, "Not found");
-    throw error;
-  }
-  const type = file.endsWith(".css") ? "text/css" : file.endsWith(".js") ? "text/javascript" : "text/html";
-  response.writeHead(200, { "content-type": `${type}; charset=utf-8`, "cache-control": "no-cache" });
-  response.end(content);
-}
-
-const handler = async (request, response) => {
-  try {
-    response.setHeader("x-content-type-options", "nosniff");
-    response.setHeader("x-frame-options", "DENY");
-    response.setHeader("referrer-policy", "no-referrer");
-    response.setHeader("cross-origin-resource-policy", "same-origin");
-    response.setHeader(
-      "content-security-policy",
-      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
-    );
-    const encrypted = Boolean(request.socket.encrypted);
-    if (secureCookies && !encrypted) throw fail(403, "HTTPS is required for this panel");
-    const requestHost = request.headers.host;
-    let hostname;
-    try {
-      hostname = new URL(`${encrypted ? "https" : "http"}://${requestHost}`).hostname.toLowerCase();
-    } catch {
-      throw fail(403, "Invalid Host header");
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      const error = new Error('Authentication request must be a JSON object.');
+      error.status = 400;
+      throw error;
     }
-    if (!allowedPanelHosts.has(hostname)) throw fail(403, "Invalid Host header");
-    const url = new URL(request.url, `${encrypted ? "https" : "http"}://${requestHost}`);
-    if (url.pathname.startsWith("/api/")) await api(request, response, url);
-    else await staticFile(request, response, url.pathname);
-  } catch (error) {
-    if (response.headersSent) {
-      response.destroy(error);
+    const session = await auth.setup(body.token, body.password, request.socket.remoteAddress ?? 'unknown');
+    response.setHeader('Set-Cookie', auth.cookie(session, secure));
+    sendJson(response, 200, { authenticated: true });
+    return;
+  }
+  if (pathname === '/api/auth/login' && method === 'POST') {
+    const body = await readJson(request);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      const error = new Error('Authentication request must be a JSON object.');
+      error.status = 400;
+      throw error;
+    }
+    const session = await auth.login(body.password, request.socket.remoteAddress ?? 'unknown');
+    response.setHeader('Set-Cookie', auth.cookie(session, secure));
+    sendJson(response, 200, { authenticated: true });
+    return;
+  }
+  if (pathname === '/api/auth/logout' && method === 'POST') {
+    auth.logout(getSessionToken(request));
+    response.setHeader('Set-Cookie', auth.clearCookie(secure));
+    sendJson(response, 200, { authenticated: false });
+    return;
+  }
+  if (!auth.authenticate(getSessionToken(request))) {
+    sendJson(response, 401, { error: 'Authentication required.' });
+    return;
+  }
+  if (pathname === '/api/health' && method === 'GET') {
+    sendJson(response, 200, { status: 'ok', name: 'Byte Server Panel' });
+    return;
+  }
+  if (pathname === '/api/versions' && method === 'GET') {
+    sendJson(response, 200, await manager.versions());
+    return;
+  }
+  if (pathname === '/api/java' && method === 'GET') {
+    sendJson(response, 200, await manager.javaRuntimes());
+    return;
+  }
+  if (pathname === '/api/providers' && method === 'GET') {
+    sendJson(response, 200, manager.providers());
+    return;
+  }
+  const providerCatalogMatch = pathname.match(/^\/api\/providers\/([a-z]+)\/catalog$/);
+  if (providerCatalogMatch && method === 'GET') {
+    sendJson(response, 200, await manager.providerCatalog(
+      providerCatalogMatch[1],
+      url.searchParams.get('minecraftVersion') ?? undefined
+    ));
+    return;
+  }
+  if (pathname === '/api/modrinth/search' && method === 'GET') {
+    sendJson(response, 200, await manager.searchModrinth({
+      query: url.searchParams.get('query') ?? '',
+      type: url.searchParams.get('type'),
+      gameVersion: url.searchParams.get('gameVersion') ?? undefined,
+      loader: url.searchParams.get('loader') ?? undefined,
+      limit: Number(url.searchParams.get('limit') ?? 20),
+      offset: Number(url.searchParams.get('offset') ?? 0)
+    }));
+    return;
+  }
+  const modrinthVersionsMatch = pathname.match(/^\/api\/modrinth\/projects\/([A-Za-z0-9_-]+)\/versions$/);
+  if (modrinthVersionsMatch && method === 'GET') {
+    sendJson(response, 200, await manager.modrinthVersions(modrinthVersionsMatch[1], {
+      type: url.searchParams.get('type') ?? undefined,
+      gameVersion: url.searchParams.get('gameVersion') ?? undefined,
+      loader: url.searchParams.get('loader') ?? undefined
+    }));
+    return;
+  }
+  const versionMatch = pathname.match(/^\/api\/versions\/([^/]+)$/);
+  if (versionMatch && method === 'GET') {
+    sendJson(response, 200, await manager.versionInfo(versionMatch[1]));
+    return;
+  }
+  if (pathname === '/api/servers' && method === 'GET') {
+    sendJson(response, 200, await manager.listServers());
+    return;
+  }
+  if (pathname === '/api/servers' && method === 'POST') {
+    sendJson(response, 201, await manager.createServer(await readJson(request)));
+    return;
+  }
+  if (pathname === '/api/events' && method === 'GET') {
+    sendJson(response, 200, manager.events());
+    return;
+  }
+  if (pathname === '/api/backups' && method === 'GET') {
+    sendJson(response, 200, await manager.listBackups());
+    return;
+  }
+  const backupDownloadMatch = pathname.match(/^\/api\/backups\/([a-z0-9-]+)\/download$/);
+  if (backupDownloadMatch && method === 'GET') {
+    const backup = await manager.getBackupDownload(backupDownloadMatch[1]);
+    response.writeHead(200, {
+      'Content-Type': 'application/gzip',
+      'Content-Length': backup.sizeBytes,
+      'Content-Disposition': `attachment; filename="${backup.filename}"`
+    });
+    createReadStream(backup.path).pipe(response);
+    return;
+  }
+  const backupDeleteMatch = pathname.match(/^\/api\/backups\/([a-z0-9-]+)$/);
+  if (backupDeleteMatch && method === 'DELETE') {
+    sendJson(response, 200, await manager.deleteBackup(backupDeleteMatch[1]));
+    return;
+  }
+  if (pathname === '/api/system' && method === 'GET') {
+    sendJson(response, 200, await manager.systemInfo());
+    return;
+  }
+  if (pathname === '/api/schedules' && method === 'GET') {
+    sendJson(response, 200, manager.listSchedules());
+    return;
+  }
+  if (pathname === '/api/diagnostics' && method === 'GET') {
+    response.setHeader('Content-Disposition', 'attachment; filename="byte-server-panel-diagnostics.json"');
+    sendJson(response, 200, await manager.diagnostics());
+    return;
+  }
+  const scheduleMatch = pathname.match(/^\/api\/schedules\/([a-f0-9-]{36})$/);
+  if (scheduleMatch && method === 'DELETE') {
+    sendJson(response, 200, manager.deleteSchedule(scheduleMatch[1]));
+    return;
+  }
+  if (pathname === '/api/tasks' && method === 'GET') {
+    sendJson(response, 200, manager.listTasks());
+    return;
+  }
+  const taskMatch = pathname.match(/^\/api\/tasks\/([a-f0-9-]{36})(?:\/(cancel))?$/);
+  if (taskMatch) {
+    const [, taskId, action] = taskMatch;
+    if (!action && method === 'GET') {
+      sendJson(response, 200, manager.getTask(taskId));
       return;
     }
-    console.error("Panel request failed:", error);
-    sendJson(response, error.status ?? 400, { error: error.message ?? "Unexpected server error" });
+    if (action === 'cancel' && method === 'POST') {
+      sendJson(response, 202, manager.cancelTask(taskId));
+      return;
+    }
   }
-};
+  const match = pathname.match(/^\/api\/servers\/([a-z0-9-]+)(?:\/([a-z-]+)(?:\/([a-z0-9-]+))?)?$/);
+  if (!match) {
+    sendJson(response, 404, { error: 'API route not found.' });
+    return;
+  }
+  const [, id, action, argument] = match;
+  if (!action && method === 'GET') {
+    sendJson(response, 200, manager.getServer(id));
+    return;
+  }
+  if (action === 'schedules' && method === 'GET') {
+    sendJson(response, 200, manager.listSchedules(id));
+    return;
+  }
+  if (action === 'schedules' && method === 'POST') {
+    sendJson(response, 201, manager.createSchedule(id, await readJson(request)));
+    return;
+  }
+  if (action === 'metrics' && method === 'GET') {
+    sendJson(response, 200, manager.getMetrics(id, url.searchParams.get('limit') ?? 1440));
+    return;
+  }
+  if (action === 'files' && method === 'GET') {
+    sendJson(response, 200, await manager.listServerFiles(id, url.searchParams.get('path') ?? ''));
+    return;
+  }
+  if (action === 'file' && method === 'GET') {
+    sendJson(response, 200, await manager.readServerFile(id, url.searchParams.get('path') ?? ''));
+    return;
+  }
+  if (action === 'file' && method === 'PUT') {
+    const body = await readJson(request);
+    sendJson(response, 200, await manager.writeServerFile(id, body.path, body.content));
+    return;
+  }
+  if (action === 'files' && method === 'POST') {
+    const body = await readJson(request);
+    sendJson(response, 201, await manager.writeServerFile(id, body.path, body.content ?? '', true));
+    return;
+  }
+  if (action === 'file' && method === 'DELETE') {
+    sendJson(response, 200, await manager.deleteServerFile(id, url.searchParams.get('path') ?? ''));
+    return;
+  }
+  if (action === 'admin' && method === 'POST') {
+    const body = await readJson(request);
+    sendJson(response, 202, await manager.sendAdminCommand(id, body.action, body.args ?? {}));
+    return;
+  }
+  if (action === 'install' && method === 'POST') {
+    sendJson(response, 202, manager.queueTask('install', id, await readJson(request)));
+    return;
+  }
+  if (action === 'content' && method === 'POST') {
+    const body = await readJson(request);
+    const taskType = body.contentType === 'modpack' ? 'modpack-install' : 'content-install';
+    sendJson(response, 202, manager.queueTask(taskType, id, body));
+    return;
+  }
+  if (action === 'start' && method === 'POST') {
+    sendJson(response, 202, await manager.start(id, await readJson(request)));
+    return;
+  }
+  if (action === 'stop' && method === 'POST') {
+    sendJson(response, 202, await manager.stop(id));
+    return;
+  }
+  if (action === 'force-stop' && method === 'POST') {
+    const options = await readJson(request);
+    if (!options || typeof options !== 'object' || Array.isArray(options) || options.confirmed !== true) {
+      const error = new Error('Explicit confirmation is required before force-stopping a process.');
+      error.status = 403;
+      throw error;
+    }
+    sendJson(response, 202, await manager.stop(id, true));
+    return;
+  }
+  if (action === 'confirm-stopped' && method === 'POST') {
+    sendJson(response, 200, manager.confirmStopped(id, await readJson(request)));
+    return;
+  }
+  if (action === 'command' && method === 'POST') {
+    sendJson(response, 202, await manager.sendCommand(id, (await readJson(request)).command));
+    return;
+  }
+  if (action === 'logs' && method === 'GET') {
+    sendJson(response, 200, await manager.getLogs(id, url.searchParams.get('after')));
+    return;
+  }
+  if (action === 'backups' && !argument && method === 'GET') {
+    sendJson(response, 200, await manager.listBackups(id));
+    return;
+  }
+  if (action === 'backups' && !argument && method === 'POST') {
+    sendJson(response, 202, manager.queueTask('backup', id, {}));
+    return;
+  }
+  if (action === 'restore' && argument && method === 'POST') {
+    sendJson(response, 202, manager.queueTask('restore', id, { ...(await readJson(request)), backupId: argument }));
+    return;
+  }
+  if (action === 'delete' && method === 'POST') {
+    sendJson(response, 200, await manager.deleteServer(id, await readJson(request)));
+    return;
+  }
+  sendJson(response, 405, { error: 'Method not allowed for this route.' });
+}
 
-export const server = secureCookies
-  ? https.createServer({
-    key: fsSync.readFileSync(tlsKeyPath),
-    cert: fsSync.readFileSync(tlsCertPath),
-    minVersion: "TLSv1.2",
-  }, handler)
-  : http.createServer(handler);
-
-export function listen() {
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, host, () => {
-      server.removeListener("error", reject);
-      resolve();
-    });
+async function serveStatic(request, response) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    sendJson(response, 405, { error: 'Method not allowed.' });
+    return;
+  }
+  const pathname = new URL(request.url, 'http://localhost').pathname;
+  const relativePath = pathname === '/' ? 'index.html' : decodeURIComponent(pathname.slice(1));
+  const filePath = path.resolve(publicDir, relativePath);
+  if (!filePath.startsWith(`${publicDir}${path.sep}`)) {
+    sendJson(response, 403, { error: 'Access denied.' });
+    return;
+  }
+  let fileStat;
+  try {
+    fileStat = await stat(filePath);
+  } catch {
+    sendJson(response, 404, { error: 'Page not found.' });
+    return;
+  }
+  if (!fileStat.isFile()) {
+    sendJson(response, 404, { error: 'Page not found.' });
+    return;
+  }
+  response.writeHead(200, {
+    'Content-Type': MIME_TYPES.get(path.extname(filePath)) ?? 'application/octet-stream',
+    'Content-Length': fileStat.size
   });
+  if (request.method === 'HEAD') response.end();
+  else createReadStream(filePath).pipe(response);
+}
+
+async function readJson(request) {
+  const chunks = [];
+  let length = 0;
+  for await (const chunk of request) {
+    length += chunk.length;
+    if (length > 16 * 1024) {
+      const error = new Error('Request body is too large.');
+      error.status = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    const error = new Error('Request body must be valid JSON.');
+    error.status = 400;
+    throw error;
+  }
+}
+
+function assertAllowedHost(request, port, knownHosts) {
+  const hostHeader = request.headers.host ?? '';
+  const separator = hostHeader.lastIndexOf(':');
+  const hostname = separator < 0 ? hostHeader : hostHeader.slice(0, separator);
+  const hostPort = separator < 0 ? '' : hostHeader.slice(separator + 1);
+  if (!knownHosts.has(hostname) || hostPort !== String(port)) {
+    const error = new Error('This panel only accepts requests addressed to an allowed local interface.');
+    error.status = 403;
+    throw error;
+  }
+}
+
+function assertSameOrigin(request, port, secure) {
+  const origin = request.headers.origin;
+  if (!origin) return;
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    const error = new Error('Invalid request origin.');
+    error.status = 403;
+    throw error;
+  }
+  const expectedProtocol = secure ? 'https:' : 'http:';
+  if (url.protocol !== expectedProtocol || url.host !== request.headers.host) {
+    const error = new Error('Cross-origin API requests are not allowed.');
+    error.status = 403;
+    throw error;
+  }
+}
+
+function localInterfaceAddresses() {
+  return Object.values(os.networkInterfaces()).flatMap((entries) =>
+    (entries ?? []).map(({ address }) => address.includes(':') ? `[${address}]` : address)
+  );
+}
+
+function applySecurityHeaders(response, secure) {
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('X-Frame-Options', 'DENY');
+  response.setHeader('Referrer-Policy', 'no-referrer');
+  response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+  response.setHeader('Cache-Control', 'no-store');
+  if (secure) response.setHeader('Strict-Transport-Security', 'max-age=31536000');
+}
+
+function sendJson(response, status, data) {
+  if (response.headersSent) return response.end();
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  response.end(JSON.stringify(data));
 }

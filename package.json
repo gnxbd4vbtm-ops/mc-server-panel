@@ -1,13 +1,17 @@
 {
-  "name": "mc-server-panel",
+  "name": "byte-server-panel",
   "version": "0.1.0",
   "private": true,
+  "description": "A self-hosted Minecraft Java server management panel",
   "type": "module",
   "engines": {
-    "node": ">=22.5"
+    "node": ">=22.13"
   },
   "scripts": {
     "start": "node src/main.js",
-    "test": "node --test"
+    "dev": "node --watch src/main.js",
+    "test": "node --test",
+    "check": "node --check src/config.js && node --check src/database.js && node --check src/auth.js && node --check src/archive.js && node --check src/server-admin.js && node --check src/ecosystem.js && node --check src/modrinth-pack.js && node --check src/rcon.js && node --check src/manager.js && node --check src/http.js && node --check src/main.js && node --check public/app.js && node --check test/auth.test.js && node --check test/archive.test.js && node --check test/server-admin.test.js && node --check test/config-validation.test.js && node --check test/ecosystem.test.js && node --check test/modrinth-pack.test.js && node --check test/rcon.test.js && node --check test/database.test.js && node --check test/http.test.js && node --check test/manager.test.js",
+    "build": "npm run check"
   }
 }

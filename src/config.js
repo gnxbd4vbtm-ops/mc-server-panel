@@ -1,51 +1,43 @@
-import os from "node:os";
-import path from "node:path";
-import net from "node:net";
+import path from 'node:path';
+import os from 'node:os';
+import { readFileSync } from 'node:fs';
 
-export const dataDir = path.resolve(
-  process.env.MC_PANEL_DATA_DIR ??
-    path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "mc-server-panel"),
-);
-export const serverRoot = path.resolve(
-  process.env.MC_PANEL_SERVER_ROOT ?? path.join(dataDir, "servers"),
-);
-export const backupRoot = path.resolve(
-  process.env.MC_PANEL_BACKUP_ROOT ?? path.join(dataDir, "backups"),
-);
-export const host = process.env.MC_PANEL_HOST ?? "127.0.0.1";
-export const port = Number(process.env.MC_PANEL_PORT ?? 8765);
-export const tlsKeyPath = process.env.MC_PANEL_TLS_KEY ? path.resolve(process.env.MC_PANEL_TLS_KEY) : null;
-export const tlsCertPath = process.env.MC_PANEL_TLS_CERT ? path.resolve(process.env.MC_PANEL_TLS_CERT) : null;
-export const curseForgeApiKey = process.env.MC_PANEL_CURSEFORGE_API_KEY ?? null;
-const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
-const remoteBinding = !loopbackHosts.has(host);
+const port = Number.parseInt(process.env.BSP_PORT ?? '18765', 10);
+const dataDir = path.resolve(process.env.BSP_DATA_DIR ?? path.join(process.cwd(), '.data'));
+const host = process.env.BSP_HOST ?? '127.0.0.1';
+const tlsCertPath = process.env.BSP_TLS_CERT ? path.resolve(process.env.BSP_TLS_CERT) : null;
+const tlsKeyPath = process.env.BSP_TLS_KEY ? path.resolve(process.env.BSP_TLS_KEY) : null;
+const allowedHosts = (process.env.BSP_ALLOWED_HOSTS ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
+const backupRetention = Number.parseInt(process.env.BSP_BACKUP_RETENTION ?? '10', 10);
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
-  throw new Error("MC_PANEL_PORT must be an integer between 1 and 65535");
-}
-if (!loopbackHosts.has(host) && !net.isIP(host)) {
-  throw new Error("MC_PANEL_HOST must be a loopback address, an IP address, or a wildcard bind address");
-}
-if (Boolean(tlsKeyPath) !== Boolean(tlsCertPath)) {
-  throw new Error("Set both MC_PANEL_TLS_KEY and MC_PANEL_TLS_CERT to enable TLS");
-}
-if (curseForgeApiKey !== null && (curseForgeApiKey.length < 20 || curseForgeApiKey.length > 512 || /[\r\n\0]/.test(curseForgeApiKey))) {
-  throw new Error("MC_PANEL_CURSEFORGE_API_KEY must be a valid API key");
-}
-if (remoteBinding && (!tlsKeyPath || !tlsCertPath)) {
-  throw new Error("Non-loopback panel binding requires TLS certificate and key files");
+  throw new Error('BSP_PORT must be a valid TCP port between 1 and 65535.');
 }
 
-const configuredAllowedHosts = (process.env.MC_PANEL_ALLOWED_HOSTS ?? "")
-  .split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
-for (const allowedHost of configuredAllowedHosts) {
-  if (!net.isIP(allowedHost) &&
-      !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/i.test(allowedHost)) {
-    throw new Error(`Invalid hostname in MC_PANEL_ALLOWED_HOSTS: ${allowedHost}`);
-  }
+const isLoopbackHost = ['127.0.0.1', 'localhost', '::1'].includes(host);
+if (!isLoopbackHost && (!tlsCertPath || !tlsKeyPath)) {
+  throw new Error('Non-loopback BSP_HOST requires BSP_TLS_CERT and BSP_TLS_KEY. LAN access must use HTTPS.');
 }
-if (remoteBinding && configuredAllowedHosts.length === 0) {
-  throw new Error("Non-loopback panel binding requires MC_PANEL_ALLOWED_HOSTS to restrict accepted Host headers");
+if (Boolean(tlsCertPath) !== Boolean(tlsKeyPath)) {
+  throw new Error('BSP_TLS_CERT and BSP_TLS_KEY must be supplied together.');
 }
-export const allowedPanelHosts = new Set(remoteBinding ? configuredAllowedHosts : [...loopbackHosts, ...configuredAllowedHosts]);
-export const secureCookies = Boolean(tlsKeyPath && tlsCertPath);
+if (!Number.isInteger(backupRetention) || backupRetention < 1 || backupRetention > 1000) {
+  throw new Error('BSP_BACKUP_RETENTION must be an integer between 1 and 1000.');
+}
+
+export const config = Object.freeze({
+  host,
+  port,
+  isLoopbackHost,
+  allowedHosts,
+  tls: tlsCertPath ? {
+    cert: readFileSync(tlsCertPath),
+    key: readFileSync(tlsKeyPath)
+  } : null,
+  dataDir,
+  serverDir: path.resolve(process.env.BSP_SERVERS_DIR ?? path.join(dataDir, 'servers')),
+  backupDir: path.resolve(process.env.BSP_BACKUPS_DIR ?? path.join(dataDir, 'backups')),
+  backupRetention,
+  databasePath: path.resolve(process.env.BSP_DATABASE_PATH ?? path.join(dataDir, 'panel.sqlite')),
+  availableMemoryMb: Math.floor(os.totalmem() / 1024 / 1024)
+});

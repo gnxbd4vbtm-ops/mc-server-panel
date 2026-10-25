@@ -1,2125 +1,1948 @@
-import fs from "node:fs/promises";
-import fsSync from "node:fs";
-import path from "node:path";
-import net from "node:net";
-import dgram from "node:dgram";
-import { spawn } from "node:child_process";
-import { EventEmitter } from "node:events";
-import { fileURLToPath } from "node:url";
-import os from "node:os";
-import { createHash, randomUUID } from "node:crypto";
-import { db } from "./database.js";
-import { backupRoot, dataDir, serverRoot } from "./config.js";
+import { spawn } from 'node:child_process';
+import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { constants, createReadStream, createWriteStream } from 'node:fs';
+import { access, chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
+import { createServer as createNetServer } from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import { config } from './config.js';
+import { createArchive, extractArchive } from './archive.js';
 import {
-  checkJava, installServer, listBedrockVersions, listFabricLoaderVersions, listFabricMinecraftVersions,
-  listForgeMinecraftVersions, listNeoForgeVersions, listPaperVersions, listPurpurVersions,
-  listQuiltLoaderVersions, listQuiltMinecraftVersions, requiredJavaMajor,
-} from "./minecraft.js";
+  createAdminExecutor, createFile as createManagedFile, deleteFile as deleteManagedFile,
+  listFiles as listManagedFiles, readFile as readManagedFile, writeFile as writeManagedFile
+} from './server-admin.js';
 import {
-  getModrinthProject, installCurseForgeProject, installModrinthProject, listCompatibleProjectVersions,
-  installCurseForgeModpack, listCurseForgeModpackVersions, listCurseForgeProjectVersions,
-  listInstalledProjects, removeInstalledProject, rollbackModrinthProject, searchCurseForge,
-  searchCurseForgeModpacks, searchModrinth, updateModrinthProject,
-} from "./providers.js";
+  downloadVerified, getModrinthVersion,
+  getProviderCatalog, listModrinthVersions, listProviders, resolveProviderInstall,
+  searchModrinth
+} from './ecosystem.js';
+import { rconCommand } from './rcon.js';
+import { parseModrinthPack } from './modrinth-pack.js';
 
-const instances = new Map();
-const terminalStates = new Map();
-const operationState = new Map();
-const jobControllers = new Map();
-let shuttingDown = false;
-const supervisorPath = fileURLToPath(new URL("./process-supervisor.js", import.meta.url));
+const VERSION_MANIFEST_URL = 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json';
+const ALLOWED_DOWNLOAD_HOSTS = new Set(['piston-meta.mojang.com', 'piston-data.mojang.com', 'launcher.mojang.com']);
+const MAX_MEMORY_FRACTION = 0.8;
+const SERVER_SOFTWARE = new Set(['vanilla', 'fabric', 'forge', 'neoforge', 'quilt', 'paper', 'purpur']);
 
-export function beginShutdown() {
-  shuttingDown = true;
-}
-
-async function serverBackupDirectory(id, create = false) {
-  if (!validId(id)) throw new Error("Invalid server identifier");
-  if (create) await fs.mkdir(backupRoot, { recursive: true, mode: 0o700 });
-  const rootStat = await fs.lstat(backupRoot);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Backup storage root is invalid");
-  const directory = path.join(backupRoot, id);
-  if (create) await fs.mkdir(directory, { mode: 0o700 }).catch((error) => {
-    if (error.code !== "EEXIST") throw error;
-  });
-  try {
-    const directoryStat = await fs.lstat(directory);
-    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || path.dirname(directory) !== backupRoot) {
-      throw new Error("Server backup directory is invalid");
-    }
-    return directory;
-  } catch (error) {
-    if (!create || error.code !== "ENOENT") throw error;
-    return null;
+export class ServerManager {
+  constructor(database, options = {}) {
+    this.db = database;
+    this.runtime = new Map();
+    this.fetch = options.fetch ?? globalThis.fetch;
+    this.serverDir = options.serverDir ?? config.serverDir;
+    this.backupDir = options.backupDir ?? config.backupDir;
+    this.backupRetention = options.backupRetention ?? config.backupRetention;
+    this.availableMemoryMb = options.availableMemoryMb ?? config.availableMemoryMb;
+    this.javaCandidates = options.javaCandidates;
+    this.javaRuntimeCache = null;
+    this.reconcileInterval = null;
+    this.taskControllers = new Map();
+    this.taskPromises = new Map();
+    this.metricsTimer = null;
+    this.schedulerTimer = null;
+    this.initialMetricsTimer = null;
+    this.metricsSamples = new Map();
+    this.rconProbeAfter = new Map();
+    this.remoteLogState = new Map();
+    this.schedulingActive = false;
   }
-}
 
-export function setAutoRestart(serverId, enabled) {
-  if (!serverQuery.get(serverId)) throw new Error("Server not found");
-  if (typeof enabled !== "boolean") throw new Error("Automatic restart setting must be a boolean");
-  db.prepare("UPDATE servers SET auto_restart = ? WHERE id = ?").run(Number(enabled), serverId);
-  return getServer(serverId);
-}
+  async initialize() {
+    await mkdir(this.serverDir, { recursive: true });
+    await mkdir(this.backupDir, { recursive: true });
+    this.db.interruptActiveTasks('Panel restarted before this operation completed.');
+    for (const entry of await readdir(this.serverDir, { withFileTypes: true })) {
+      if (entry.isDirectory() && /^\.provider-stage-[0-9a-f-]{36}$/.test(entry.name)) {
+        await rm(path.join(this.serverDir, entry.name), { recursive: true, force: true });
+      }
+    }
+    for (const server of this.db.listServers()) {
+      let entries;
+      try {
+        entries = await readdir(server.directory, { withFileTypes: true });
+      } catch (error) {
+        if (error.code === 'ENOENT') continue;
+        throw error;
+      }
+      const refreshed = this.db.getServer(server.id);
+      if (refreshed?.installed && refreshed.status === 'stopped') {
+        await this.ensureRconConfiguration(refreshed);
+      }
+      for (const entry of entries) {
+        if (entry.isFile() && /^\.server-[0-9a-f-]{36}\.jar\.tmp$/.test(entry.name)) {
+          await rm(path.join(server.directory, entry.name), { force: true });
+        }
+      }
+    }
+    for (const server of this.db.listServers()) {
+      if (server.status === 'running' || server.status === 'starting' || server.status === 'stopping') {
+        if (await isManagedProcess(server.processPid, server)) {
+          this.db.updateServer(server.id, { status: 'orphaned', error: 'Server process is still running but is not attached to this panel session.' });
+          this.db.addEvent(server.id, 'warning', 'Found a running server process after panel restart; console is unavailable.');
+        } else if (!server.processPid) {
+          this.db.updateServer(server.id, { status: 'unknown', error: 'Previous panel session did not save a process ID; verify the server is stopped before continuing.' });
+          this.db.addEvent(server.id, 'warning', 'Cannot verify the previous process state; manual confirmation is required.');
+        } else {
+          this.db.updateServer(server.id, { status: 'stopped', process_pid: null, error: null });
+          this.db.addEvent(server.id, 'info', 'Previous server process was not found after panel restart.');
+        }
+      }
+    }
+    await this.reconcileOrphanedProcesses();
+    this.reconcileInterval = setInterval(() => {
+      this.reconcileOrphanedProcesses().catch((error) => console.error('[manager] Process reconciliation failed:', error));
+    }, 3000);
+    this.reconcileInterval.unref();
+    this.schedulerTimer = setInterval(() => {
+      this.runDueSchedules().catch((error) => console.error('[manager] Scheduler failed:', error));
+    }, 15000);
+    this.schedulerTimer.unref();
+    this.metricsTimer = setInterval(() => {
+      this.sampleMetrics().catch((error) => console.error('[manager] Metrics collection failed:', error));
+    }, 60000);
+    this.metricsTimer.unref();
+    this.initialMetricsTimer = setTimeout(() => {
+      this.sampleMetrics().catch((error) => console.error('[manager] Initial metrics collection failed:', error));
+    }, 1000).unref();
+  }
 
-export async function queryOnlinePlayers(serverId) {
-  const instance = instances.get(serverId);
-  if (!instance || !["running", "starting"].includes(instance.status)) throw new Error("Server is not running");
-  if (instance.listQuery) throw new Error("A player-list query is already in progress");
-  return new Promise(async (resolve, reject) => {
-    let timer;
-    const unsubscribe = subscribe(serverId, (text) => {
-      const response = /There are (\d+) of a max of \d+ players online(?::\s*(.*))?/i.exec(text);
-      if (!response) return;
-      clearTimeout(timer);
-      unsubscribe();
-      instance.listQuery = false;
-      resolve({ count: Number(response[1]), players: response[2]?.split(",").map((name) => name.trim()).filter(Boolean) ?? [] });
-    });
-    instance.listQuery = true;
-    timer = setTimeout(() => {
-      unsubscribe();
-      instance.listQuery = false;
-      reject(new Error("Timed out waiting for the server's actual list response"));
-    }, 5000);
+  async ensureRconConfiguration(server) {
+    if (!Number.isInteger(server.rconPort) || server.rconPort < 1 || server.rconPort > 65535) {
+      server.rconPort = await this.allocateRconPort(server.port);
+      this.db.updateServer(server.id, { rcon_port: server.rconPort });
+    }
+    const secretPath = path.join(server.directory, '.panel-rcon-secret');
+    let secret;
     try {
-      await sendCommand(serverId, "list");
+      secret = await readRconSecret(server.directory);
     } catch (error) {
-      clearTimeout(timer);
-      unsubscribe();
-      instance.listQuery = false;
-      reject(error);
+      if (error.code !== 'ENOENT') throw error;
+      secret = randomBytes(32).toString('base64url');
+      try {
+        await writeFile(secretPath, `${secret}\n`, { flag: 'wx', mode: 0o600 });
+      } catch (writeError) {
+        if (writeError.code !== 'EEXIST') throw writeError;
+        secret = (await readFile(secretPath, 'utf8')).trim();
+      }
     }
-  });
-}
-
-async function udpPortAvailable(server, port = server.bedrock_port, ipv6 = false) {
-  return new Promise((resolve, reject) => {
-    const address = ipv6 ? "::" : server.bind_address;
-    const socket = dgram.createSocket(net.isIPv6(address) ? "udp6" : "udp4");
-    socket.once("error", (error) => {
-      socket.close();
-      if (error.code === "EADDRINUSE" || error.code === "EACCES") resolve(false);
-      else if (ipv6 && error.code === "EADDRNOTAVAIL") resolve(true);
-      else reject(error);
-    });
-    socket.bind({ address, port, exclusive: true }, () => {
-      socket.close((error) => error ? reject(error) : resolve(true));
-    });
-  });
-}
-
-async function queryCommandOutput(serverId, command, pattern, timeoutMs = 5000) {
-  const instance = instances.get(serverId);
-  if (!instance || !["running", "starting"].includes(instance.status)) throw new Error("Server is not running");
-  if (instance.telemetryQuery) throw new Error("A telemetry query is already in progress");
-  return new Promise((resolve, reject) => {
-    let timer;
-    let pending = "";
-    const unsubscribe = subscribe(serverId, (text) => {
-      pending = (pending + text).slice(-4096);
-      const match = pattern.exec(pending);
-      if (!match) return;
-      clearTimeout(timer);
-      unsubscribe();
-      instance.telemetryQuery = false;
-      resolve(match);
-    });
-    instance.telemetryQuery = true;
-    timer = setTimeout(() => {
-      unsubscribe();
-      instance.telemetryQuery = false;
-      reject(new Error(`Timed out waiting for the server's ${command} response`));
-    }, timeoutMs);
-    sendCommand(serverId, command).catch((error) => {
-      clearTimeout(timer);
-      unsubscribe();
-      instance.telemetryQuery = false;
-      reject(error);
-    });
-  });
-}
-
-export async function queryServerTelemetry(serverId) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (!["paper", "purpur"].includes(server.loader ?? server.software)) {
-    throw new Error("TPS/MSPT queries require Paper or Purpur software");
+    if (!/^[A-Za-z0-9_-]{40,60}$/.test(secret)) {
+      throw clientError('Managed RCON credential file contains invalid data.', 422);
+    }
+    await chmod(secretPath, 0o600);
+    const propertiesPath = path.join(server.directory, 'server.properties');
+    let properties = '';
+    try {
+      const propertiesStat = await lstat(propertiesPath);
+      if (!propertiesStat.isFile() || propertiesStat.isSymbolicLink()) {
+        throw clientError('server.properties is not a regular file.', 422);
+      }
+      properties = await readFile(propertiesPath, 'utf8');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    const managed = new Map([
+      ['enable-rcon', 'true'],
+      ['rcon.port', String(server.rconPort)],
+      ['rcon.password', secret],
+      ['rcon.ip', '127.0.0.1'],
+      ['broadcast-rcon-to-ops', 'false']
+    ]);
+    const lines = properties.split(/\r?\n/).filter((line) => !managed.has(line.split('=', 1)[0]));
+    for (const [key, value] of managed) lines.push(`${key}=${value}`);
+    await writeFile(propertiesPath, `${lines.filter(Boolean).join('\n')}\n`, { mode: 0o600 });
+    await chmod(propertiesPath, 0o600);
+    return secret;
   }
-  const tpsResponse = await queryCommandOutput(serverId, "tps",
-    /TPS from last [^:]+:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)/i);
-  const msptResponse = await queryCommandOutput(serverId, "mspt",
-    /(?:Average|Mean) tick time:\s*([\d.]+)\s*ms/i);
-  const tps = tpsResponse.slice(1, 4).map(Number);
-  const mspt = Number(msptResponse[1]);
-  if (tps.some((value) => !Number.isFinite(value) || value < 0 || value > 20.1) ||
-      !Number.isFinite(mspt) || mspt < 0 || mspt > 60000) {
-    throw new Error("Server telemetry response contained out-of-range values");
+
+  async allocateRconPort(serverPort) {
+    const reserved = new Set(this.db.listServers().flatMap((server) => [server.port, server.rconPort]));
+    for (let attempt = 0; attempt < 32; attempt += 1) {
+      const port = randomInt(30000, 60001);
+      if (port !== serverPort && !reserved.has(port) && await isPortAvailable(port)) return port;
+    }
+    throw clientError('Could not find a free local RCON port.');
   }
-  const instance = instances.get(serverId);
-  if (instance) {
-    instance.tps = tps;
-    instance.mspt = mspt;
+
+  async listServers() {
+    return Promise.all(this.db.listServers().map(async (server) => {
+      try {
+        return { ...publicServer(server), players: null, uptimeSeconds: this.getUptime(server.id), diskBytes: await directorySize(server.directory), diskError: null };
+      } catch (error) {
+        return { ...publicServer(server), players: null, uptimeSeconds: this.getUptime(server.id), diskBytes: null, diskError: safeMessage(error) };
+      }
+    }));
   }
-  return { tps, mspt };
-}
 
-const validPlayerName = /^[A-Za-z0-9_]{1,16}$/;
-const resolvedProfiles = new Map();
+  getServer(id) {
+    const server = this.requireServer(id);
+    return { ...publicServer(server), uptimeSeconds: this.getUptime(id) };
+  }
 
-function formatUuid(bytes) {
-  const hex = bytes.toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
+  async versions() {
+    const response = await this.fetchMojang(VERSION_MANIFEST_URL, { signal: AbortSignal.timeout(15000) });
+    if (!response.ok) throw clientError(`Minecraft version catalogue returned HTTP ${response.status}.`, 502);
+    const manifest = await response.json();
+    return (manifest.versions ?? []).map(({ id, type, releaseTime }) => ({ id, type, releaseTime }));
+  }
 
-function offlinePlayerUuid(name) {
-  const bytes = createHash("md5").update(`OfflinePlayer:${name}`, "utf8").digest();
-  bytes[6] = (bytes[6] & 0x0f) | 0x30;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  return formatUuid(bytes);
-}
-
-export async function resolvePlayerProfile(serverId, player) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (!validPlayerName.test(player ?? "")) throw new Error("Player name must contain 1-16 letters, numbers, or underscores");
-  if (!server.online_mode) {
+  async versionInfo(id) {
+    validateMinecraftVersion(id);
+    const manifestResponse = await this.fetchMojang(VERSION_MANIFEST_URL, { signal: AbortSignal.timeout(15000) });
+    if (!manifestResponse.ok) throw clientError(`Minecraft version catalogue returned HTTP ${manifestResponse.status}.`, 502);
+    const manifest = await manifestResponse.json();
+    const version = manifest.versions?.find((entry) => entry.id === id);
+    if (!version) throw clientError(`Minecraft ${id} is not in the official version catalogue.`, 404);
+    const metadataResponse = await this.fetchMojang(checkedMojangUrl(version.url), { signal: AbortSignal.timeout(15000) });
+    if (!metadataResponse.ok) throw clientError(`Version metadata returned HTTP ${metadataResponse.status}.`, 502);
+    const metadata = await metadataResponse.json();
     return {
-      name: player,
-      uuid: offlinePlayerUuid(player),
-      identity_type: "offline-derived",
-      identity_warning: "Offline-mode UUIDs are derived from names and do not prove player identity.",
+      id,
+      type: version.type,
+      releaseTime: version.releaseTime,
+      requiredJavaMajor: requiredJavaMajor(id, metadata)
     };
   }
-  const cached = resolvedProfiles.get(player.toLowerCase());
-  if (cached && cached.expiresAt > Date.now()) return cached.profile;
-  const response = await fetch(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(player)}`, {
-    headers: { accept: "application/json" },
-    signal: AbortSignal.timeout(10000),
-    redirect: "error",
-  });
-  if (response.status === 204 || response.status === 404) throw new Error("No Mojang profile exists for that player name");
-  if (!response.ok) throw new Error(`Mojang profile lookup failed with HTTP ${response.status}`);
-  if (new URL(response.url).hostname !== "api.mojang.com") throw new Error("Mojang profile lookup redirected to an untrusted host");
-  const body = await response.json();
-  if (body.name?.toLowerCase() !== player.toLowerCase() || !/^[0-9a-f]{32}$/i.test(body.id ?? "")) {
-    throw new Error("Mojang returned invalid player profile metadata");
-  }
-  const profile = {
-    name: body.name,
-    uuid: formatUuid(Buffer.from(body.id, "hex")),
-    identity_type: "mojang",
-    identity_warning: null,
-  };
-  resolvedProfiles.set(player.toLowerCase(), { profile, expiresAt: Date.now() + 5 * 60 * 1000 });
-  return profile;
-}
 
-export async function playerAction(serverId, action, player, reason = "") {
-  if (!validPlayerName.test(player ?? "")) throw new Error("Player name must contain 1-16 letters, numbers, or underscores");
-  if (typeof reason !== "string" || reason.length > 160 || /[\r\n\0"\\;]/.test(reason)) {
-    throw new Error("Reason must be at most 160 characters and contain no quotes, slashes, or line breaks");
+  async javaRuntimes() {
+    if (this.javaRuntimeCache && this.javaRuntimeCache.expiresAt > Date.now()) {
+      return this.javaRuntimeCache.runtimes;
+    }
+    const candidates = await this.getJavaCandidates();
+    const unique = new Set();
+    const runtimes = [];
+    for (const candidate of candidates) {
+      const runtime = await inspectJava(candidate);
+      if (!runtime || unique.has(runtime.path)) continue;
+      unique.add(runtime.path);
+      runtimes.push(runtime);
+    }
+    runtimes.sort((left, right) => right.majorVersion - left.majorVersion || left.path.localeCompare(right.path));
+    this.javaRuntimeCache = { runtimes, expiresAt: Date.now() + 30000 };
+    return runtimes;
   }
-  const commands = {
-    kick: "kick", ban: "ban", pardon: "pardon", whitelistAdd: "whitelist add",
-    whitelistRemove: "whitelist remove", op: "op", deop: "deop",
-  };
-  if (!commands[action]) throw new Error("Unsupported player action");
-  const command = `${commands[action]} ${player}${["kick", "ban"].includes(action) && reason ? ` ${reason}` : ""}`;
-  await sendCommand(serverId, command);
-}
 
-export async function getPlayerRecords(serverId) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (instances.has(serverId)) throw new Error("Stop the server before reading permission files");
-  const directory = await serverDirectory(serverId);
-  const files = ["whitelist.json", "ops.json", "banned-players.json"];
-  const result = {};
-  for (const filename of files) {
+  async inspectJava(javaPath) {
+    const candidate = validateText(javaPath, 'Java executable', 1, 512);
+    const inspected = await inspectJava(candidate);
+    if (!inspected) throw clientError(`Could not run "${candidate}" or determine its Java version. Check the executable path and permissions.`, 422);
+    return inspected;
+  }
+
+  providers() {
+    return listProviders();
+  }
+
+  async providerCatalog(providerId, minecraftVersion) {
     try {
-      const stat = await fs.lstat(path.join(directory, filename));
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error(`${filename} is not a safe regular file`);
-      const records = JSON.parse(await fs.readFile(path.join(directory, filename), "utf8"));
-      if (!Array.isArray(records)) throw new Error(`${filename} must contain a JSON array`);
-      result[filename] = records;
+      return await getProviderCatalog(providerId, {
+        minecraftVersion,
+        fetchImpl: this.fetch,
+        timeoutMs: 15000
+      });
     } catch (error) {
-      if (error.code === "ENOENT") result[filename] = [];
-      else throw error;
+      throw normalizeEcosystemError(error);
     }
   }
-  return result;
-}
 
-function validatePermissionRecords(filename, records) {
-  if (!["whitelist.json", "ops.json", "banned-players.json"].includes(filename)) {
-    throw new Error("Unsupported permission file");
-  }
-  if (!Array.isArray(records) || records.length > 10000) throw new Error("Permission records must be an array of at most 10,000 entries");
-  const seen = new Set();
-  return records.map((record) => {
-    if (!record || typeof record !== "object" || Array.isArray(record) ||
-        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(record.uuid ?? "") ||
-        !validPlayerName.test(record.name ?? "")) {
-      throw new Error("Each permission record must contain a valid UUID and Minecraft player name");
+  async searchModrinth(options) {
+    try {
+      return await searchModrinth({ ...options, fetchImpl: this.fetch });
+    } catch (error) {
+      throw normalizeEcosystemError(error);
     }
-    const key = record.uuid.toLowerCase();
-    if (seen.has(key)) throw new Error("Permission records cannot contain duplicate UUIDs");
-    seen.add(key);
-    if (filename === "whitelist.json") return { uuid: key, name: record.name };
-    if (filename === "ops.json") {
-      if (!Number.isInteger(record.level) || record.level < 1 || record.level > 4 ||
-          typeof record.bypassesPlayerLimit !== "boolean") {
-        throw new Error("Operator records require a permission level from 1 to 4 and a boolean player-limit setting");
-      }
-      return { uuid: key, name: record.name, level: record.level, bypassesPlayerLimit: record.bypassesPlayerLimit };
+  }
+
+  async modrinthVersions(projectId, options) {
+    try {
+      return await listModrinthVersions(projectId, { ...options, fetchImpl: this.fetch });
+    } catch (error) {
+      throw normalizeEcosystemError(error);
     }
-    for (const field of ["created", "source", "expires", "reason"]) {
-      if (typeof record[field] !== "string" || record[field].length > 256 || /[\0\r\n]/.test(record[field])) {
-        throw new Error(`Banned-player records require a safe ${field} string`);
-      }
+  }
+
+  async createServer(input) {
+    requireObject(input, 'Server configuration');
+    const name = validateText(input.name, 'Server name', 2, 48);
+    const version = validateMinecraftVersion(input.minecraftVersion);
+    const software = input.software ?? 'vanilla';
+    if (typeof software !== 'string' || !SERVER_SOFTWARE.has(software)) throw clientError('Choose a supported Minecraft server software provider.');
+    const memoryMb = Number(input.memoryMb ?? 2048);
+    const configuredMemoryMb = this.db.listServers().reduce((total, server) => total + server.memoryMb, 0);
+    const memoryLimitMb = Math.floor(this.availableMemoryMb * MAX_MEMORY_FRACTION);
+    const remainingMemoryMb = Math.max(0, memoryLimitMb - configuredMemoryMb);
+    if (!Number.isInteger(memoryMb) || memoryMb < 512 || memoryMb > remainingMemoryMb) {
+      throw clientError(`Memory must be between 512 MB and ${remainingMemoryMb} MB based on available memory and existing server allocations.`);
     }
-    return { uuid: key, name: record.name, created: record.created, source: record.source, expires: record.expires, reason: record.reason };
-  });
-}
-
-export async function updatePlayerRecords(serverId, filename, records) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (instances.has(serverId)) throw new Error("Stop the server before editing permission files");
-  const validated = validatePermissionRecords(filename, records);
-  const directory = await serverDirectory(serverId);
-  const target = path.join(directory, filename);
-  try {
-    const stat = await fs.lstat(target);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${filename} is not a safe regular file`);
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-  const temporary = path.join(directory, `.${filename}.${randomUUID()}.tmp`);
-  try {
-    await fs.writeFile(temporary, `${JSON.stringify(validated, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-    await fs.rename(temporary, target);
-  } catch (error) {
-    await fs.rm(temporary, { force: true });
-    throw error;
-  }
-  return { filename, records: validated };
-}
-
-export function getServerHistory(serverId, limit = 240) {
-  if (!serverQuery.get(serverId)) throw new Error("Server not found");
-  if (!Number.isInteger(limit) || limit < 1 || limit > 1440) throw new Error("History limit must be 1-1440");
-  const metrics = db.prepare(`SELECT cpu_percent, memory_mb, disk_bytes, players, tps_1m, mspt, sampled_at
-    FROM metrics_history WHERE server_id = ? ORDER BY id DESC LIMIT ?`).all(serverId, limit).reverse();
-  const crashes = db.prepare(`SELECT exit_code, occurred_at FROM crash_history
-    WHERE server_id = ? ORDER BY id DESC LIMIT 20`).all(serverId);
-  return { metrics, crashes };
-}
-
-export async function getWorlds(serverId) {
-  const directory = await serverDirectory(serverId);
-  const entries = await fs.readdir(directory, { withFileTypes: true });
-  let levelName = "world";
-  try {
-    const properties = await fs.readFile(path.join(directory, "server.properties"), "utf8");
-    const match = /^level-name=(.+)$/m.exec(properties);
-    if (match && validWorldName.test(match[1])) levelName = match[1];
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-  const worlds = entries.filter((entry) => entry.isDirectory() &&
-    [levelName, `${levelName}_nether`, `${levelName}_the_end`].includes(entry.name));
-  return Promise.all(worlds.map(async (entry) => ({
-    name: entry.name,
-    path: entry.name,
-    size_bytes: await diskUsage(path.join(directory, entry.name)),
-  })));
-}
-
-const validWorldName = /^[A-Za-z0-9_-]{1,64}$/;
-
-export async function listWorldBackups(serverId) {
-  if (!serverQuery.get(serverId)) throw new Error("Server not found");
-  return db.prepare(`SELECT id, world_name, filename, created_at FROM world_backups
-    WHERE server_id = ? ORDER BY created_at DESC, rowid DESC`).all(serverId);
-}
-
-async function createWorldArchive(serverId, worldName) {
-  if (!validWorldName.test(worldName ?? "")) throw new Error("Invalid world folder name");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  const directory = await serverDirectory(serverId);
-  const worldPath = path.join(directory, worldName);
-  const worldStat = await fs.lstat(worldPath);
-  if (!worldStat.isDirectory() || worldStat.isSymbolicLink()) throw new Error("World folder is not a regular directory");
-  const backups = await serverBackupDirectory(serverId, true);
-  const id = randomUUID();
-  const filename = `${serverId}-${worldName}-${id}.world.tar.gz`;
-  const destination = path.join(backups, filename);
-  const child = spawn("tar", ["-czf", destination, "--", worldName], {
-    cwd: directory, stdio: ["ignore", "ignore", "pipe"], shell: false,
-  });
-  let errorOutput = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => (errorOutput = (errorOutput + chunk).slice(-4096)));
-  const exitCode = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", resolve);
-  });
-  if (exitCode !== 0) {
-    await fs.rm(destination, { force: true });
-    throw new Error(`World backup failed: ${errorOutput.trim() || `tar exited with ${exitCode}`}`);
-  }
-  try {
-    await inspectWorldArchive(destination, worldName);
-  } catch (error) {
-    await fs.rm(destination, { force: true });
-    throw error;
-  }
-  db.prepare("INSERT INTO world_backups(id,server_id,world_name,filename) VALUES(?,?,?,?)")
-    .run(id, serverId, worldName, filename);
-  return { id, world_name: worldName, filename, created_at: new Date().toISOString() };
-}
-
-async function createWorldBackupInternal(serverId, worldName) {
-  if (instances.has(serverId)) throw new Error("Stop the server before creating a consistent world backup");
-  return createWorldArchive(serverId, worldName);
-}
-
-export const createWorldBackup = withServerOperation("backing up world", createWorldBackupInternal);
-
-function sendCommandAndWait(serverId, command, responsePattern, timeoutMs = 120000) {
-  const instance = instances.get(serverId);
-  if (!instance || instance.status !== "running") throw new Error("Server is not running");
-  return new Promise((resolve, reject) => {
-    let pending = "";
-    const unsubscribe = subscribe(serverId, (text) => {
-      pending = (pending + text).slice(-8192);
-      const match = responsePattern.exec(pending);
-      if (!match) return;
-      clearTimeout(timer);
-      unsubscribe();
-      resolve(match);
+    const port = Number(input.port ?? 25565);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      throw clientError('Server port must be between 1024 and 65535.');
+    }
+    if (this.db.listServers().some((server) => server.port === port)) {
+      throw clientError(`Port ${port} is already assigned to a managed server.`);
+    }
+    if (!await isPortAvailable(port)) throw clientError(`Port ${port} is already in use by another process.`);
+    const javaPath = validateText(input.javaPath ?? 'java', 'Java executable', 1, 512);
+    const description = typeof input.description === 'string' ? input.description.slice(0, 500) : '';
+    const rconPort = await this.allocateRconPort(port);
+    const id = `${slugify(name).slice(0, 32) || 'server'}-${randomUUID().slice(0, 8)}`;
+    const directory = path.join(this.serverDir, id);
+    const server = this.db.insertServer({
+      id, name, description, minecraftVersion: version, software, javaPath, memoryMb, port, directory,
+      rconPort,
+      eulaAccepted: false,
+      createdAt: new Date().toISOString()
     });
-    const timer = setTimeout(() => {
-      unsubscribe();
-      reject(new Error(`Timed out waiting for server response to ${command}`));
-    }, timeoutMs);
-    sendCommand(serverId, command).catch((error) => {
-      clearTimeout(timer);
-      unsubscribe();
-      reject(error);
-    });
-  });
-}
+    try {
+      await mkdir(directory, { recursive: false });
+    } catch (error) {
+      this.db.deleteServer(id);
+      throw error;
+    }
+    this.db.addEvent(id, 'success', `Created ${name} (${version}, ${software}).`);
+    return publicServer(server);
+  }
 
-async function createLiveWorldSnapshotInternal(serverId, worldName) {
-  const instance = instances.get(serverId);
-  if (!instance || instance.status !== "running") throw new Error("Live world snapshots require a running server");
-  if (!validWorldName.test(worldName ?? "")) throw new Error("Invalid world folder name");
-  let saveOffRequested = false;
-  let snapshot;
-  let snapshotError;
-  let saveOnError;
-  try {
-    saveOffRequested = true;
-    await sendCommandAndWait(serverId, "save-off", /automatic saving is now disabled/i);
-    await sendCommandAndWait(serverId, "save-all flush", /saved the game/i);
-    snapshot = await createWorldArchive(serverId, worldName);
-  } catch (error) {
-    snapshotError = error;
-  } finally {
-    if (saveOffRequested && instances.has(serverId)) {
+  async install(id, options = {}) {
+    requireObject(options, 'Installation review');
+    if (options.confirmed !== true) throw clientError('Explicit confirmation is required before downloading a server jar.', 403);
+    const server = this.requireServer(id);
+    if (server.status === 'unknown' || server.status === 'orphaned') {
+      throw clientError('Verify and stop the previous process before installing software into this instance.');
+    }
+    if (server.installed) throw clientError('This server is already installed.');
+    if (server.software !== 'vanilla') return this.installProvider(server, options);
+    checkCancelled(options.signal);
+    options.onProgress?.(5, 'Loading official Minecraft metadata.');
+    const manifestResponse = await this.fetchMojang(VERSION_MANIFEST_URL, { signal: combineSignals(options.signal, AbortSignal.timeout(15000)) });
+    if (!manifestResponse.ok) throw clientError(`Minecraft version catalogue returned HTTP ${manifestResponse.status}.`, 502);
+    const manifest = await manifestResponse.json();
+    const versionEntry = manifest.versions?.find((entry) => entry.id === server.minecraftVersion);
+    if (!versionEntry) throw clientError(`Minecraft ${server.minecraftVersion} is not in the official version catalogue.`, 404);
+    const versionResponse = await this.fetchMojang(checkedMojangUrl(versionEntry.url), { signal: combineSignals(options.signal, AbortSignal.timeout(15000)) });
+    if (!versionResponse.ok) throw clientError(`Version metadata returned HTTP ${versionResponse.status}.`, 502);
+    const metadata = await versionResponse.json();
+    checkCancelled(options.signal);
+    options.onProgress?.(12, 'Checking Java compatibility and disk space.');
+    const javaMajor = requiredJavaMajor(server.minecraftVersion, metadata);
+    this.assertJavaCompatibility(await this.inspectJava(server.javaPath), javaMajor);
+    const download = metadata.downloads?.server;
+    if (!download?.url || !Number.isSafeInteger(download.size) || download.size <= 0 || download.size > 2 * 1024 ** 3) {
+      throw clientError(`Minecraft ${server.minecraftVersion} does not publish a downloadable server jar.`, 422);
+    }
+    if (typeof download.sha1 !== 'string' || !/^[a-f0-9]{40}$/i.test(download.sha1)) {
+      throw clientError('Mojang did not provide a valid SHA-1 checksum for this server jar.', 422);
+    }
+    const filesystem = await statfs(server.directory);
+    const freeBytes = filesystem.bavail * filesystem.bsize;
+    if (freeBytes < download.size + 50 * 1024 ** 2) {
+      throw clientError('There is not enough free disk space for this server jar and its initial files.', 507);
+    }
+    const url = checkedMojangUrl(download.url);
+    const temporaryJar = path.join(server.directory, `.server-${randomUUID()}.jar.tmp`);
+    const jarPath = path.join(server.directory, 'server.jar');
+    try {
+      await lstat(jarPath);
+      throw clientError('A server.jar already exists in this instance; refusing to overwrite it.');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    let jarCommitted = false;
+    let propertiesCreated = false;
+    try {
+      const response = await this.fetchMojang(url, { signal: combineSignals(options.signal, AbortSignal.timeout(120000)) });
+      if (!response.ok || !response.body) throw clientError(`Server download returned HTTP ${response.status}.`, 502);
+      const hash = createHash('sha1');
+      let bytes = 0;
+      await pipeline(response.body, async function* (source) {
+        for await (const chunk of source) {
+          bytes += chunk.length;
+          hash.update(chunk);
+          options.onProgress?.(Math.min(95, 15 + Math.floor(bytes / download.size * 80)), `Downloading and verifying server jar (${Math.min(100, Math.floor(bytes / download.size * 100))}%).`);
+          if (bytes > download.size * 1.05) throw clientError('Downloaded file exceeded the size reported by Mojang.', 502);
+          yield chunk;
+        }
+      }, createWriteStream(temporaryJar, { flags: 'wx', mode: 0o600 }), ...(options.signal ? [{ signal: options.signal }] : []));
+      checkCancelled(options.signal);
+      if (bytes !== download.size) throw clientError('Downloaded server jar has an unexpected size.', 502);
+      if (hash.digest('hex') !== download.sha1.toLowerCase()) {
+        throw clientError('Downloaded server jar failed Mojang SHA-1 verification.', 502);
+      }
+      await rename(temporaryJar, jarPath);
+      jarCommitted = true;
+      if (server.eulaAccepted) await writeFile(path.join(server.directory, 'eula.txt'), 'eula=true\n', { mode: 0o600 });
       try {
-        await sendCommandAndWait(serverId, "save-on", /automatic saving is now enabled/i, 15000);
+        await writeFile(path.join(server.directory, 'server.properties'), [
+          `server-port=${server.port}`,
+          'max-players=20',
+          'online-mode=true',
+          'view-distance=10',
+          'simulation-distance=10',
+          'motd=A Minecraft Server',
+          ''
+        ].join('\n'), { mode: 0o600, flag: 'wx' });
+        propertiesCreated = true;
       } catch (error) {
-        saveOnError = error;
+        if (error.code !== 'EEXIST') throw error;
       }
-    }
-  }
-  if (saveOnError) {
-    const detail = snapshotError ? `Snapshot failed: ${snapshotError.message}. ` : "";
-    throw new Error(`${detail}Could not confirm that automatic world saving was re-enabled; check the server console immediately. ${saveOnError.message}`);
-  }
-  if (snapshotError) throw snapshotError;
-  return { ...snapshot, consistent_snapshot: true };
-}
-
-export const createLiveWorldSnapshot = withServerOperation("taking live world snapshot", createLiveWorldSnapshotInternal);
-
-export async function getWorldBackupDownload(serverId, backupId) {
-  if (!serverQuery.get(serverId)) throw new Error("Server not found");
-  const backup = db.prepare("SELECT filename FROM world_backups WHERE id = ? AND server_id = ?").get(backupId, serverId);
-  if (!backup || path.basename(backup.filename) !== backup.filename || !backup.filename.endsWith(".world.tar.gz")) {
-    throw new Error("World backup not found");
-  }
-  const directory = await serverBackupDirectory(serverId);
-  const filename = path.join(directory, backup.filename);
-  const stat = await fs.lstat(filename);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("World backup file is invalid");
-  return { path: filename, filename: backup.filename, size: stat.size };
-}
-
-async function inspectWorldArchive(archive, worldName) {
-  const listing = spawn("tar", ["-tzf", archive], { stdio: ["ignore", "pipe", "pipe"], shell: false });
-  let entriesText = "";
-  let listingError = "";
-  listing.stdout.setEncoding("utf8");
-  listing.stderr.setEncoding("utf8");
-  listing.stdout.on("data", (chunk) => {
-    entriesText += chunk;
-    if (entriesText.length > 20 * 1024 * 1024) listing.kill("SIGKILL");
-  });
-  listing.stderr.on("data", (chunk) => { listingError = (listingError + chunk).slice(-4096); });
-  const listingCode = await new Promise((resolve, reject) => {
-    listing.once("error", reject);
-    listing.once("close", resolve);
-  });
-  if (listingCode !== 0) throw new Error(`Could not inspect world archive: ${listingError.trim()}`);
-  const entries = entriesText.split("\n").filter(Boolean);
-  if (!entries.length || entries.length > 200000) throw new Error("World archive has an invalid number of entries");
-  for (const entry of entries) {
-    const normalized = entry.endsWith("/") ? entry.slice(0, -1) : entry;
-    if (entry.includes("\\") || /[\0\r\n]/.test(entry) || path.posix.isAbsolute(normalized) ||
-        (normalized !== worldName && !normalized.startsWith(`${worldName}/`)) ||
-        normalized.split("/").some((part) => !part || part === "." || part === "..") ||
-        !/^[A-Za-z0-9 _./-]+$/.test(normalized)) {
-      throw new Error("World archive contains an unsafe or unexpected path");
-    }
-  }
-  const types = spawn("tar", ["--quoting-style=escape", "-tvzf", archive], {
-    stdio: ["ignore", "pipe", "pipe"], shell: false,
-  });
-  let typesText = "";
-  let typesError = "";
-  types.stdout.setEncoding("utf8");
-  types.stderr.setEncoding("utf8");
-  types.stdout.on("data", (chunk) => {
-    typesText += chunk;
-    if (typesText.length > 20 * 1024 * 1024) types.kill("SIGKILL");
-  });
-  types.stderr.on("data", (chunk) => { typesError = (typesError + chunk).slice(-4096); });
-  const typesCode = await new Promise((resolve, reject) => {
-    types.once("error", reject);
-    types.once("close", resolve);
-  });
-  if (typesCode !== 0) throw new Error(`Could not inspect world archive entry types: ${typesError.trim()}`);
-  const typesList = typesText.split("\n").filter(Boolean);
-  if (typesList.length !== entries.length || typesList.some((line) => !/^[\-d]/.test(line))) {
-    throw new Error("World archive contains a symbolic link or special file");
-  }
-  let unpackedBytes = 0;
-  for (const line of typesList) {
-    const size = /^[\-d][^\s]*\s+\S+\s+(\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+/.exec(line);
-    if (!size) throw new Error("World archive has invalid size metadata");
-    unpackedBytes += Number(size[1]);
-    if (!Number.isSafeInteger(unpackedBytes) || unpackedBytes > 20 * 1024 ** 3) {
-      throw new Error("World archive exceeds the 20 GiB expanded-size limit");
-    }
-  }
-  return unpackedBytes;
-}
-
-async function restoreWorldBackupInternal(serverId, backupId) {
-  if (instances.has(serverId)) throw new Error("Stop the server before importing a world backup");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  const backup = db.prepare("SELECT world_name, filename FROM world_backups WHERE id = ? AND server_id = ?").get(backupId, serverId);
-  if (!backup || !validWorldName.test(backup.world_name) || path.basename(backup.filename) !== backup.filename) {
-    throw new Error("World backup not found");
-  }
-  const backups = await serverBackupDirectory(serverId);
-  const archive = path.join(backups, backup.filename);
-  const archiveStat = await fs.lstat(archive);
-  if (!archiveStat.isFile() || archiveStat.isSymbolicLink()) throw new Error("World backup file is invalid");
-  const directory = await serverDirectory(serverId);
-  const expandedBytes = await inspectWorldArchive(archive, backup.world_name);
-  const disk = await fs.statfs(directory);
-  if (disk.bavail * disk.bsize < expandedBytes + 100 * 1024 * 1024) {
-    throw new Error("Insufficient free space to restore this world safely");
-  }
-  const staging = path.join(directory, `.panel-world-import-${randomUUID()}`);
-  const stagedWorld = path.join(staging, backup.world_name);
-  await fs.mkdir(staging, { mode: 0o700 });
-  const child = spawn("tar", ["-xzf", archive, "--no-same-owner", "-C", staging], {
-    stdio: ["ignore", "ignore", "pipe"], shell: false,
-  });
-  let errorOutput = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => (errorOutput = (errorOutput + chunk).slice(-4096)));
-  const exitCode = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", resolve);
-  }).catch(async (error) => {
-    await fs.rm(staging, { recursive: true, force: true });
-    throw error;
-  });
-  if (exitCode !== 0) {
-    await fs.rm(staging, { recursive: true, force: true });
-    throw new Error(`World import failed: ${errorOutput.trim() || `tar exited with ${exitCode}`}`);
-  }
-  let stagedStat;
-  try {
-    stagedStat = await fs.lstat(stagedWorld);
-  } catch (error) {
-    await fs.rm(staging, { recursive: true, force: true });
-    throw error;
-  }
-  if (!stagedStat.isDirectory() || stagedStat.isSymbolicLink()) {
-    await fs.rm(staging, { recursive: true, force: true });
-    throw new Error("World archive does not contain its expected world directory");
-  }
-  const destination = path.join(directory, backup.world_name);
-  const previous = path.join(directory, `.panel-world-previous-${randomUUID()}`);
-  let movedPrevious = false;
-  let installed = false;
-  try {
-    try {
-      const currentStat = await fs.lstat(destination);
-      if (!currentStat.isDirectory() || currentStat.isSymbolicLink()) throw new Error("Current world path is not a regular directory");
-      await fs.rename(destination, previous);
-      movedPrevious = true;
+      await this.ensureRconConfiguration(this.db.getServer(id));
+      this.db.markServerInstalled(id, `Installed Vanilla ${server.minecraftVersion}.`, javaMajor);
+      options.onProgress?.(100, 'Installation complete.');
+      jarCommitted = false;
+      propertiesCreated = false;
+      return { installed: true, version: server.minecraftVersion };
     } catch (error) {
-      if (error.code !== "ENOENT") throw error;
+      await rm(temporaryJar, { force: true });
+      if (jarCommitted) await rm(jarPath, { force: true });
+      if (propertiesCreated) await rm(path.join(server.directory, 'server.properties'), { force: true });
+      this.db.addEvent(id, 'error', `Installation failed: ${safeMessage(error)}`);
+      throw error;
     }
-    await fs.rename(stagedWorld, destination);
-    installed = true;
-  } catch (error) {
-    if (installed) await fs.rm(destination, { recursive: true, force: true });
-    if (movedPrevious) await fs.rename(previous, destination);
-    throw error;
-  } finally {
-    await fs.rm(staging, { recursive: true, force: true });
   }
-  if (movedPrevious) await fs.rm(previous, { recursive: true, force: true });
-  return { world_name: backup.world_name, restored: true };
-}
 
-export const restoreWorldBackup = withServerOperation("importing world", restoreWorldBackupInternal);
-
-async function importWorldArchiveInternal(serverId, relativeArchivePath, worldName) {
-  if (instances.has(serverId)) throw new Error("Stop the server before importing a world");
-  if (!validWorldName.test(worldName ?? "")) throw new Error("Invalid world folder name");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  const root = await serverDirectory(serverId);
-  const archive = resolveRelative(root, relativeArchivePath);
-  if (archive === root || path.basename(archive) !== relativeArchivePath.split(/[\\/]/).at(-1) ||
-      !archive.endsWith(".tar.gz")) throw new Error("World import requires a .tar.gz archive inside the server directory");
-  await assertPathNoSymlink(root, archive);
-  const archiveStat = await fs.lstat(archive);
-  if (!archiveStat.isFile() || archiveStat.isSymbolicLink() || archiveStat.size > 100 * 1024 * 1024) {
-    throw new Error("World archive must be a regular file no larger than 100 MB");
-  }
-  await inspectWorldArchive(archive, worldName);
-  const backups = await serverBackupDirectory(serverId, true);
-  const id = randomUUID();
-  const filename = `${serverId}-${worldName}-${id}.world.tar.gz`;
-  const storedArchive = path.join(backups, filename);
-  await fs.copyFile(archive, storedArchive, fsSync.constants.COPYFILE_EXCL);
-  db.prepare("INSERT INTO world_backups(id,server_id,world_name,filename) VALUES(?,?,?,?)")
-    .run(id, serverId, worldName, filename);
-  let worldImported = false;
-  try {
-    const restored = await restoreWorldBackupInternal(serverId, id);
-    worldImported = true;
-    await fs.rm(archive);
-    return { ...restored, backup_id: id };
-  } catch (error) {
-    if (!worldImported) {
-      db.prepare("DELETE FROM world_backups WHERE id = ? AND server_id = ?").run(id, serverId);
-      await fs.rm(storedArchive, { force: true });
+  async installProvider(server, options = {}) {
+    checkCancelled(options.signal);
+    options.onProgress?.(5, `Loading ${server.software} metadata.`);
+    const info = await this.versionInfo(server.minecraftVersion);
+    this.assertJavaCompatibility(await this.inspectJava(server.javaPath), info.requiredJavaMajor);
+    let artifact;
+    let installArgs = null;
+    let softwareVersion = null;
+    let loaderVersion = null;
+    let catalog;
+    if (['paper', 'purpur'].includes(server.software)) {
+      artifact = await resolveProviderInstall(server.software, {
+        minecraftVersion: server.minecraftVersion, fetchImpl: this.fetch, signal: options.signal
+      });
+      softwareVersion = artifact.build === undefined ? null : String(artifact.build);
     } else {
-      throw new Error(`World imported, but the uploaded archive could not be removed: ${error.message}`);
+      catalog = await getProviderCatalog(server.software, {
+        fetchImpl: this.fetch, signal: options.signal
+      });
+      if (server.software === 'fabric' || server.software === 'quilt') {
+        const loader = catalog.loaders.find((entry) => entry.stable) ?? catalog.loaders[0];
+        const installer = catalog.installers.find((entry) => entry.stable) ?? catalog.installers[0];
+        if (!loader || !installer) throw clientError(`No ${server.software} loader installer is published.`, 422);
+        loaderVersion = loader.version;
+        softwareVersion = loader.version;
+        artifact = await resolveProviderInstall(server.software, {
+          version: installer.version, fetchImpl: this.fetch, signal: options.signal
+        });
+        installArgs = server.software === 'fabric'
+          ? ['server', '-mcversion', server.minecraftVersion, '-loader', loaderVersion, '-downloadMinecraft']
+          : ['install', 'server', server.minecraftVersion, '--download-server'];
+      } else {
+        const prefix = server.software === 'forge'
+          ? `${server.minecraftVersion}-`
+          : neoForgeVersionPrefix(server.minecraftVersion);
+        softwareVersion = catalog.versions.filter((version) => version.startsWith(prefix)).at(-1);
+        if (!softwareVersion) throw clientError(`The official ${server.software} catalog has no installer artifact for Minecraft ${server.minecraftVersion}.`, 422);
+        artifact = await resolveProviderInstall(server.software, {
+          version: softwareVersion, fetchImpl: this.fetch, signal: options.signal
+        });
+        installArgs = ['--installServer'];
+      }
     }
-    throw error;
-  }
-}
-
-export const importWorldArchive = withServerOperation("importing world", importWorldArchiveInternal);
-
-function diskUsage(directory) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("du", ["-sb", "--", directory], { stdio: ["ignore", "pipe", "pipe"], shell: false });
-    let output = "";
-    let errorOutput = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { output = (output + chunk).slice(-1024); });
-    child.stderr.on("data", (chunk) => { errorOutput = (errorOutput + chunk).slice(-2048); });
-    child.once("error", reject);
-    child.once("close", (code) => {
-      if (code !== 0) return reject(new Error(`Could not calculate directory size: ${errorOutput.trim()}`));
-      const size = /^(\d+)\s/.exec(output);
-      if (!size) return reject(new Error("Directory size command returned invalid output"));
-      resolve(Number(size[1]));
-    });
-  });
-}
-const serversQuery = db.prepare("SELECT * FROM servers ORDER BY created_at DESC");
-const serverQuery = db.prepare("SELECT * FROM servers WHERE id = ?");
-const usedNames = db.prepare("SELECT id FROM servers WHERE id = ?");
-
-function processStartTicks(pid) {
-  const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
-  return stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
-}
-
-function validJavaArgFileLaunch(args) {
-  return Array.isArray(args) && args.length === 3 &&
-    args[0] === "@user_jvm_args.txt" &&
-    /^@libraries\/net\/(?:minecraftforge\/forge|neoforged\/neoforge)\/[A-Za-z0-9._+-]{1,128}\/unix_args\.txt$/.test(args[1]) &&
-    args[2] === "nogui";
-}
-
-function processIdentityMatches(server) {
-  if (!Number.isInteger(server.pid) || !server.process_start_ticks || !server.process_boot_id) return false;
-  try {
-    if (fsSync.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() !== server.process_boot_id ||
-        processStartTicks(server.pid) !== server.process_start_ticks) return false;
-    if (process.getuid && Number(/^Uid:\s+(\d+)/m.exec(fsSync.readFileSync(`/proc/${server.pid}/status`, "utf8"))?.[1]) !== process.getuid()) return false;
-    const directory = fsSync.realpathSync(`/proc/${server.pid}/cwd`);
-    const expected = fsSync.realpathSync(path.join(serverRoot, server.id));
-    if (directory !== expected) return false;
-    const command = fsSync.readFileSync(`/proc/${server.pid}/cmdline`, "utf8").split("\0");
-    const marker = JSON.parse(fsSync.readFileSync(path.join(expected, "server-panel.json"), "utf8"));
-    if (typeof marker.executable === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(marker.executable)) {
-      return fsSync.realpathSync(`/proc/${server.pid}/exe`) === fsSync.realpathSync(path.join(expected, marker.executable));
+    const filesystem = await statfs(server.directory);
+    if (filesystem.bavail * filesystem.bsize < 256 * 1024 ** 2) {
+      throw clientError('At least 256 MiB of free disk space is required for this provider installation.', 507);
     }
-    if (typeof marker.jar === "string" && command.some((argument, index) =>
-      argument === "-jar" && command[index + 1] === marker.jar)) return true;
-    return validJavaArgFileLaunch(marker.java_args) &&
-      marker.java_args.filter((argument) => argument.startsWith("@")).every((argument) => command.includes(argument));
-  } catch {
-    return false;
-  }
-}
-
-export function refreshRecoveredProcesses() {
-  for (const server of serversQuery.all()) {
-    if (instances.has(server.id)) continue;
-    if (server.pid && processIdentityMatches(server)) {
-      terminalStates.set(server.id, { status: "orphaned", lastExitCode: null });
-    } else if (server.pid) {
-      db.prepare("UPDATE servers SET pid = NULL, process_start_ticks = NULL, process_boot_id = NULL WHERE id = ?").run(server.id);
-      terminalStates.delete(server.id);
-    }
-  }
-}
-refreshRecoveredProcesses();
-
-export async function reattachRecoveredProcesses() {
-  for (const server of serversQuery.all()) {
-    if (!server.pid || instances.has(server.id) || !processIdentityMatches(server)) continue;
-    const socketPath = path.join(dataDir, "run", `${server.id}.sock`);
+    const stage = path.join(this.serverDir, `.provider-stage-${randomUUID()}`);
+    await mkdir(stage, { recursive: false, mode: 0o700 });
+    const installedPaths = [];
     try {
-      const child = await connectSupervisor(socketPath, server.pid);
-      if (!processIdentityMatches(server)) {
-        child.socket.destroy();
-        continue;
+      options.onProgress?.(15, `Downloading and verifying ${server.software} artifact.`);
+      const bytes = await downloadVerified(artifact, {
+        fetchImpl: this.fetch, maxBytes: 512 * 1024 ** 2, signal: options.signal
+      });
+      checkCancelled(options.signal);
+      if (artifact.installType === 'server') {
+        await writeFile(path.join(stage, 'server.jar'), bytes, { flag: 'wx', mode: 0o600 });
+      } else {
+        const installerPath = path.join(stage, 'installer.jar');
+        await writeFile(installerPath, bytes, { flag: 'wx', mode: 0o600 });
+        options.onProgress?.(35, `Running verified ${server.software} installer.`);
+        await runInstaller(server.javaPath, ['-jar', installerPath, ...installArgs], stage, options);
+        await rm(installerPath, { force: true });
       }
-      const instance = watchManagedProcess(server, child, true);
-      if (child.exitCode === null && child.signalCode === null) {
-        instance.status = /Done \(/.test(child.recoveryHistory) ? "running" : "starting";
-        terminalStates.delete(server.id);
+      checkCancelled(options.signal);
+      installedPaths.push(...await mergeDirectory(stage, server.directory));
+      if (['fabric', 'quilt'].includes(server.software)) {
+        const launcher = server.software === 'fabric' ? 'fabric-server-launch.jar' : 'quilt-server-launch.jar';
+        await rename(path.join(server.directory, launcher), path.join(server.directory, 'server.jar'));
+        installedPaths.push(path.join(server.directory, 'server.jar'));
       }
+      if (['forge', 'neoforge'].includes(server.software)) {
+        const argsPath = server.software === 'forge'
+          ? path.join(server.directory, 'libraries', 'net', 'minecraftforge', 'forge', softwareVersion, 'unix_args.txt')
+          : path.join(server.directory, 'libraries', 'net', 'neoforged', 'neoforge', softwareVersion, 'unix_args.txt');
+        const argsStat = await lstat(argsPath);
+        if (!argsStat.isFile() || argsStat.isSymbolicLink()) throw clientError(`${server.software} installer did not produce a safe Unix server argument file.`);
+      }
+      const propertiesPath = path.join(server.directory, 'server.properties');
+      await writeFile(propertiesPath, [
+        `server-port=${server.port}`, 'max-players=20', 'online-mode=true',
+        'view-distance=10', 'simulation-distance=10', 'motd=A Minecraft Server', ''
+      ].join('\n'), { flag: 'wx', mode: 0o600 });
+      installedPaths.push(propertiesPath);
+      if (server.eulaAccepted) {
+        const eulaPath = path.join(server.directory, 'eula.txt');
+        await writeFile(eulaPath, 'eula=true\n', { flag: 'wx', mode: 0o600 });
+        installedPaths.push(eulaPath);
+      }
+      await this.ensureRconConfiguration(server);
+      this.db.updateServer(server.id, {
+        software_version: softwareVersion,
+        loader_version: loaderVersion
+      });
+      this.db.markServerInstalled(server.id, `Installed ${server.software} for Minecraft ${server.minecraftVersion}.`, info.requiredJavaMajor);
+      options.onProgress?.(100, 'Provider installation complete.');
+      return { installed: true, software: server.software, version: softwareVersion };
     } catch (error) {
-      console.error(`Could not reattach to recovered server ${server.id}:`, error.message);
-      terminalStates.set(server.id, { status: "orphaned", lastExitCode: null });
-    }
-  }
-}
-
-export function serializeServer(server) {
-  const instance = instances.get(server.id);
-  const operation = operationState.get(server.id);
-  return {
-    ...server,
-    eula_accepted: Boolean(server.eula_accepted),
-    crossplay: Boolean(server.crossplay),
-    auto_restart: Boolean(server.auto_restart),
-    operation: operation ?? null,
-    status: instance?.status ?? (operation === "starting" ? "starting" :
-      operation === "installing" || operation === "restoring" ? "updating" :
-        terminalStates.get(server.id)?.status ?? "stopped"),
-    pid: instance?.child.pid ?? (terminalStates.get(server.id)?.status === "orphaned" ? server.pid : null),
-    uptime_seconds: instance?.startedAt ? Math.floor((Date.now() - instance.startedAt) / 1000) : 0,
-    players: instance?.playersKnown ? instance.players.size : null,
-    online_players: instance?.playersKnown ? [...instance.players] : null,
-    memory_mb: instance?.memoryMb ?? null,
-    cpu_percent: instance?.cpuPercent ?? null,
-    tps: instance?.tps ?? null,
-    mspt: instance?.mspt ?? null,
-    last_exit_code: instance?.lastExitCode ?? terminalStates.get(server.id)?.lastExitCode ?? null,
-  };
-}
-
-function withServerOperation(name, action) {
-  return async (...args) => {
-    const serverId = args[0];
-    if (operationState.has(serverId)) {
-      throw new Error(`Cannot ${name} while ${operationState.get(serverId)} is in progress`);
-    }
-    operationState.set(serverId, name);
-    try {
-      return await action(...args);
+      for (const filename of installedPaths.reverse()) {
+        await rm(filename, { recursive: false, force: true }).catch((cleanupError) => {
+          console.error(`[manager] Could not roll back provider installation file ${filename}:`, cleanupError);
+        });
+      }
+      throw error;
     } finally {
-      operationState.delete(serverId);
-    }
-  };
-}
-
-export function getServers() {
-  refreshRecoveredProcesses();
-  return serversQuery.all().map(serializeServer);
-}
-
-export function getLanAddresses() {
-  return Object.values(os.networkInterfaces()).flatMap((interfaces) => (interfaces ?? [])
-    .filter((network) => !network.internal && (network.family === "IPv4" || network.family === 4))
-    .map((network) => network.address));
-}
-
-export function getServer(id) {
-  refreshRecoveredProcesses();
-  const server = serverQuery.get(id);
-  if (!server) return undefined;
-  return serializeServer(server);
-}
-
-export async function searchProjects(serverId, options = {}) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (!["modrinth", "curseforge"].includes(options.source ?? "modrinth")) throw new Error("Unsupported project provider");
-  if (options.source === "curseforge") return searchCurseForge(server, options);
-  return searchModrinth(server, options);
-}
-
-export async function getProject(serverId, projectId, type = "mod") {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  return getModrinthProject(server, projectId, type);
-}
-
-export async function getProjectVersions(serverId, projectId, type = "mod", source = "modrinth") {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (!["modrinth", "curseforge"].includes(source)) throw new Error("Unsupported project provider");
-  if (source === "curseforge" && type !== "mod") throw new Error("CurseForge plugin discovery is not supported");
-  if (source === "curseforge") return listCurseForgeProjectVersions(server, projectId);
-  return listCompatibleProjectVersions(server, projectId, type);
-}
-
-export async function searchModpacks(serverId, options = {}) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (options.source !== "curseforge") throw new Error("Only CurseForge modpack discovery is supported");
-  return searchCurseForgeModpacks(server, options);
-}
-
-export async function getModpackVersions(serverId, projectId) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  return listCurseForgeModpackVersions(server, projectId);
-}
-
-export async function getInstalledProjects(serverId, type = "mod") {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  return listInstalledProjects(server, await serverDirectory(serverId), type);
-}
-
-async function installProjectInternal(serverId, projectId, versionId, type = "mod", source = "modrinth") {
-  if (instances.has(serverId)) throw new Error("Stop the server before installing projects");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (!["modrinth", "curseforge"].includes(source)) throw new Error("Unsupported project provider");
-  if (source === "curseforge" && type !== "mod") throw new Error("CurseForge plugin installation is not supported");
-  if (source === "curseforge") {
-    return installCurseForgeProject(server, await serverDirectory(serverId), projectId, versionId);
-  }
-  return installModrinthProject(server, await serverDirectory(serverId), projectId, versionId, type);
-}
-
-export const installProject = withServerOperation("project installation", installProjectInternal);
-
-async function installModpackInternal(serverId, projectId, fileId) {
-  if (instances.has(serverId)) throw new Error("Stop the server before installing a modpack");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  return installCurseForgeModpack(server, await serverDirectory(serverId), projectId, fileId);
-}
-
-export const installModpack = withServerOperation("modpack installation", installModpackInternal);
-
-async function updateProjectInternal(serverId, projectId, type = "mod") {
-  if (instances.has(serverId)) throw new Error("Stop the server before updating projects");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  return updateModrinthProject(server, await serverDirectory(serverId), projectId, type);
-}
-
-export const updateProject = withServerOperation("project update", updateProjectInternal);
-
-async function rollbackProjectInternal(serverId, projectId, type = "mod") {
-  if (instances.has(serverId)) throw new Error("Stop the server before rolling back projects");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  return rollbackModrinthProject(server, await serverDirectory(serverId), projectId, type);
-}
-
-export const rollbackProject = withServerOperation("project rollback", rollbackProjectInternal);
-
-async function removeProjectInternal(serverId, filename, type = "mod") {
-  if (instances.has(serverId)) throw new Error("Stop the server before removing projects");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  return removeInstalledProject(server, await serverDirectory(serverId), filename, type);
-}
-
-export const removeProject = withServerOperation("project removal", removeProjectInternal);
-
-function validId(id) {
-  return typeof id === "string" && /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/.test(id);
-}
-
-function findManagedPortConflict(ports, exceptServerId = null) {
-  const candidates = [...new Set(ports)];
-  const placeholders = candidates.map(() => "?").join(", ");
-  const exclusion = exceptServerId ? "id != ? AND " : "";
-  const parameters = [...(exceptServerId ? [exceptServerId] : []), ...candidates, ...candidates, ...candidates];
-  return db.prepare(`SELECT id FROM servers WHERE ${exclusion}
-    (port IN (${placeholders}) OR bedrock_port IN (${placeholders}) OR
-      (loader = 'bedrock' AND port + 1 IN (${placeholders})))`).get(...parameters);
-}
-
-function validateConfiguration(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Expected server configuration");
-  const { name, id, description = "", version, software, port, bind_address = "0.0.0.0",
-    max_players = 20, min_memory_mb = 1024, max_memory_mb = 2048, java_path = "java",
-    auto_restart = false, online_mode = true, view_distance = 10, simulation_distance = 10 } = input;
-  const crossplay = input.crossplay ?? false;
-  const bedrockPort = input.bedrock_port ?? (crossplay ? 19132 : null);
-  const requestedLoader = input.loader ?? software;
-  const storedSoftware = software === "purpur" ? "paper" :
-    ["fabric", "quilt", "forge", "neoforge", "bedrock"].includes(software) ? "vanilla" : software;
-  const compatibleLoader = {
-    vanilla: "vanilla", paper: "paper", purpur: "purpur", fabric: "fabric",
-    quilt: "quilt", forge: "forge", neoforge: "neoforge", bedrock: "bedrock",
-  }[software];
-  if (typeof name !== "string" || name.trim().length < 1 || name.trim().length > 64 || /[\r\n\0]/.test(name)) {
-    throw new Error("Server name must be 1-64 characters and contain no line breaks");
-  }
-  if (!validId(id)) throw new Error("Server identifier must use lowercase letters, numbers, and hyphens");
-  if (usedNames.get(id)) throw new Error("That server identifier is already in use");
-  if (typeof version !== "string" || !/^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/.test(version)) {
-    throw new Error("Choose a valid Minecraft version identifier");
-  }
-  if (!compatibleLoader || requestedLoader !== compatibleLoader) {
-    throw new Error("Supported server software: Bedrock Dedicated Server, Vanilla, Paper, Purpur, Fabric, Quilt, Forge, and NeoForge");
-  }
-  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Server port must be between 1024 and 65535");
-  if (typeof crossplay !== "boolean") throw new Error("Cross-play setting must be a boolean");
-  if (crossplay && !["paper", "purpur"].includes(requestedLoader)) {
-    throw new Error("Automatic Java/Bedrock cross-play currently requires Paper or Purpur");
-  }
-  if (crossplay && (!Number.isInteger(bedrockPort) || bedrockPort < 1024 || bedrockPort > 65534 || bedrockPort === port)) {
-    throw new Error("Bedrock cross-play UDP port must be between 1024 and 65534 and differ from the Java port");
-  }
-  if (requestedLoader === "bedrock" && port > 65534) {
-    throw new Error("Bedrock Dedicated Server reserves the next port for IPv6; choose a port no higher than 65534");
-  }
-  if (!crossplay && bedrockPort !== null) throw new Error("A separate Bedrock UDP port is only valid when cross-play is enabled");
-  if (!Number.isInteger(max_players) || max_players < 1 || max_players > 1000) throw new Error("Maximum players must be between 1 and 1000");
-  if (!Number.isInteger(min_memory_mb) || !Number.isInteger(max_memory_mb) ||
-      min_memory_mb < 512 || max_memory_mb < min_memory_mb || max_memory_mb > Math.floor(os.totalmem() / 1024 / 1024 * 0.9)) {
-    throw new Error("Memory must be at least 512 MB, initial memory cannot exceed maximum, and maximum must be below 90% of system RAM");
-  }
-  if (typeof description !== "string" || description.length > 500) throw new Error("Description must be at most 500 characters");
-  if (typeof bind_address !== "string" || !net.isIP(bind_address)) throw new Error("Bind address must be an IPv4 or IPv6 address");
-  if (requestedLoader !== "bedrock" &&
-      (typeof java_path !== "string" || java_path.length < 1 || java_path.length > 4096 || java_path.includes("\0"))) {
-    throw new Error("Java path is invalid");
-  }
-  if (typeof auto_restart !== "boolean") throw new Error("Automatic restart must be a boolean");
-  if (typeof online_mode !== "boolean") throw new Error("Online mode must be a boolean");
-  if (!Number.isInteger(view_distance) || view_distance < 2 || view_distance > 32) throw new Error("View distance must be between 2 and 32 chunks");
-  if (!Number.isInteger(simulation_distance) || simulation_distance < 2 || simulation_distance > 32) {
-    throw new Error("Simulation distance must be between 2 and 32 chunks");
-  }
-  return {
-    id, name: name.trim(), description, version, software: storedSoftware, loader: requestedLoader, port, bind_address,
-    max_players, min_memory_mb, max_memory_mb, java_path, auto_restart, online_mode, view_distance, simulation_distance,
-    crossplay, bedrock_port: bedrockPort,
-  };
-}
-
-export async function createServer(input) {
-  const config = validateConfiguration(input);
-  if (config.loader === "bedrock" && !(await listBedrockVersions()).some((version) => version.id === config.version)) {
-    throw new Error(`Official Bedrock Dedicated Server does not list version ${config.version}`);
-  }
-  const servicePorts = config.loader === "bedrock"
-    ? [config.port, config.port + 1]
-    : [config.port, ...(config.crossplay ? [config.bedrock_port] : [])];
-  if (findManagedPortConflict(servicePorts)) {
-    throw new Error("A configured Java or Bedrock port number is already assigned to another server");
-  }
-  if (config.loader === "bedrock" && !await udpPortAvailable(config, config.port + 1, true)) {
-    throw new Error(`Bedrock IPv6 port ${config.port + 1} is already in use on ${config.bind_address}`);
-  }
-  if (config.loader === "paper" && !new Set(await listPaperVersions()).has(config.version)) {
-    throw new Error(`Paper does not support Minecraft ${config.version}`);
-  }
-  if (config.loader === "purpur" && !new Set(await listPurpurVersions()).has(config.version)) {
-    throw new Error(`Purpur does not support Minecraft ${config.version}`);
-  }
-  if (config.loader === "fabric") {
-    if (!new Set(await listFabricMinecraftVersions()).has(config.version)) {
-      throw new Error(`Fabric does not support stable Minecraft ${config.version}`);
-    }
-    if (!(await listFabricLoaderVersions(config.version)).length) {
-      throw new Error(`No stable Fabric loader is available for Minecraft ${config.version}`);
+      await rm(stage, { recursive: true, force: true });
     }
   }
-  if (config.loader === "quilt") {
-    if (!new Set(await listQuiltMinecraftVersions()).has(config.version)) {
-      throw new Error(`Quilt does not support stable Minecraft ${config.version}`);
+
+  async installModrinthContent(serverId, input, options = {}) {
+    const server = this.requireServer(serverId);
+    if (this.runtime.has(serverId) || !['stopped', 'crashed'].includes(server.status)) {
+      throw clientError('Stop and verify the server before installing content.');
     }
-    if (!(await listQuiltLoaderVersions(config.version)).length) {
-      throw new Error(`No Quilt loader is available for Minecraft ${config.version}`);
+    const type = input.contentType;
+    if (!['mod', 'plugin'].includes(type) || typeof input.versionId !== 'string') {
+      throw clientError('Choose a Modrinth mod or plugin version.');
     }
-  }
-  if (config.loader === "forge" && !new Set(await listForgeMinecraftVersions()).has(config.version)) {
-    throw new Error(`Forge does not support Minecraft ${config.version}`);
-  }
-  if (config.loader === "neoforge" && !(await listNeoForgeVersions(config.version)).length) {
-    throw new Error(`NeoForge does not support Minecraft ${config.version}`);
-  }
-  await fs.mkdir(serverRoot, { recursive: true, mode: 0o700 });
-  await fs.mkdir(path.join(serverRoot, config.id), { mode: 0o700 });
-  let inserted = false;
-  try {
-    db.prepare(`INSERT INTO servers(id,name,description,version,software,loader,port,bind_address,max_players,min_memory_mb,max_memory_mb,java_path,auto_restart,online_mode,view_distance,simulation_distance,crossplay,bedrock_port)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      config.id, config.name, config.description, config.version, config.software, config.loader, config.port,
-      config.bind_address, config.max_players, config.min_memory_mb, config.max_memory_mb,
-      config.loader === "bedrock" ? "" : config.java_path, Number(config.auto_restart),
-      Number(config.online_mode), config.view_distance, config.simulation_distance,
-      Number(config.crossplay), config.bedrock_port,
-    );
-    inserted = true;
-    if (config.loader !== "bedrock") await fs.writeFile(path.join(serverRoot, config.id, "server.properties"), [
-      "# Generated by Byte Server Panel; edit in the Configuration tab",
-      `motd=${config.name}`,
-      `server-ip=${config.bind_address === "0.0.0.0" ? "" : config.bind_address}`,
-      `server-port=${config.port}`,
-      `max-players=${config.max_players}`,
-      `online-mode=${config.online_mode}`,
-      `view-distance=${config.view_distance}`,
-      `simulation-distance=${config.simulation_distance}`,
-      "",
-    ].join("\n"), { mode: 0o600, flag: "wx" });
-  } catch (error) {
-    if (inserted) db.prepare("DELETE FROM servers WHERE id = ?").run(config.id);
-    await fs.rm(path.join(serverRoot, config.id), { recursive: true, force: true });
-    throw error;
-  }
-  return getServer(config.id);
-}
-
-async function deleteServerInternal(id) {
-  const server = serverQuery.get(id);
-  if (!server) throw new Error("Server not found");
-  if (instances.has(id)) throw new Error("Stop the server before deleting it");
-  const directory = await serverDirectory(id);
-  const trash = path.join(serverRoot, `.deleting-${randomUUID()}`);
-  const backupDirectory = path.join(backupRoot, id);
-  const backupTrash = path.join(backupRoot, `.deleting-${id}-${randomUUID()}`);
-  let movedBackup = false;
-  await fs.rename(directory, trash);
-  try {
-    try {
-      const backupStat = await fs.lstat(backupDirectory);
-      if (!backupStat.isDirectory() || backupStat.isSymbolicLink()) throw new Error("Backup directory is invalid");
-      await fs.rename(backupDirectory, backupTrash);
-      movedBackup = true;
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
+    if (type === 'mod' && !['fabric', 'forge', 'neoforge', 'quilt'].includes(server.software)) {
+      throw clientError('Mods require a Fabric, Forge, NeoForge, or Quilt server.');
     }
-    db.prepare("DELETE FROM servers WHERE id = ?").run(id);
-  } catch (error) {
-    await fs.rename(trash, directory);
-    if (movedBackup) await fs.rename(backupTrash, backupDirectory);
-    throw error;
-  }
-  await fs.rm(trash, { recursive: true, force: true });
-  if (movedBackup) await fs.rm(backupTrash, { recursive: true, force: true });
-}
-
-export const deleteServer = withServerOperation("delete", deleteServerInternal);
-
-async function serverDirectory(id) {
-  if (!validId(id)) throw new Error("Invalid server identifier");
-  const directory = path.join(serverRoot, id);
-  const stat = await fs.lstat(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(directory) !== serverRoot) {
-    throw new Error("Server directory is invalid");
-  }
-  return directory;
-}
-
-async function portAvailable(server) {
-  if (server.loader === "bedrock") {
-    return udpPortAvailable(server, server.port);
-  }
-  return new Promise((resolve, reject) => {
-    const listener = net.createServer();
-    listener.once("error", (error) => {
-      if (error.code === "EADDRINUSE" || error.code === "EACCES") resolve(false);
-      else reject(error);
+    if (type === 'plugin' && !['paper', 'purpur'].includes(server.software)) {
+      throw clientError('Plugins require a Paper or Purpur server.');
+    }
+    checkCancelled(options.signal);
+    options.onProgress?.(10, 'Loading Modrinth version metadata.');
+    const version = await getModrinthVersion(input.versionId, {
+      type, fetchImpl: this.fetch, signal: options.signal
     });
-    listener.listen({ host: server.bind_address, port: server.port, exclusive: true }, () => {
-      listener.close((error) => error ? reject(error) : resolve(true));
+    if (!version.gameVersions.includes(server.minecraftVersion)) {
+      throw clientError(`This ${type} version does not support Minecraft ${server.minecraftVersion}.`, 422);
+    }
+    const supportedLoaders = type === 'plugin'
+      ? [server.software, 'bukkit', 'spigot']
+      : [server.software];
+    if (!version.loaders.some((loader) => supportedLoaders.includes(loader))) {
+      throw clientError(`This ${type} version does not support ${server.software}.`, 422);
+    }
+    const folder = type === 'plugin' ? 'plugins' : 'mods';
+    const file = version.files.find((candidate) => candidate.primary) ?? version.files[0];
+    const filename = file.filename;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,254}$/.test(filename)) {
+      throw clientError('Modrinth returned an unsafe content filename.', 422);
+    }
+    const bytes = await downloadVerified({ ...file, providerId: 'modrinth' }, {
+      fetchImpl: this.fetch, maxBytes: 512 * 1024 ** 2, signal: options.signal
     });
-  });
-}
-
-async function installInternal(serverId, options = {}) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (instances.has(serverId)) throw new Error("Stop the server before installing or updating it");
-  const directory = await serverDirectory(serverId);
-  const installation = await installServer(server, directory, options);
-  const { filename, javaMajor, executable, crossplay } = installation;
-  if (options.signal?.aborted) {
-    if (filename) await fs.rm(path.join(directory, filename), { force: true });
-    throw new DOMException("Installation cancelled", "AbortError");
+    options.onProgress?.(80, `Installing verified ${type} ${version.versionNumber}.`);
+    const installed = await writeImportedFiles(server.directory, new Map([[`${folder}/${filename}`, bytes]]));
+    this.db.addEvent(serverId, 'success', `Installed verified Modrinth ${type} ${version.versionNumber}.`);
+    options.onProgress?.(100, 'Content installation complete.');
+    return { installed, type, version: version.versionNumber };
   }
-  await fs.writeFile(path.join(directory, "server-panel.json"), JSON.stringify({
-    ...(filename ? { jar: filename } : {}),
-    ...(executable ? { executable, args: [] } : {}),
-    ...(installation.javaArgs ? { java_args: installation.javaArgs } : {}),
-    software: server.software, loader: server.loader, version: installation.version ?? server.version, java_major: javaMajor,
-    ...(crossplay ? { crossplay: true, bedrock_port: server.bedrock_port } : {}),
-    ...(installation.loaderVersion ? { loader_version: installation.loaderVersion } : {}),
-    ...(installation.installerVersion ? { installer_version: installation.installerVersion } : {}),
-  }, null, 2), { mode: 0o600 });
-  if (installation.version) {
-    db.prepare("UPDATE servers SET version = ? WHERE id = ?").run(installation.version, serverId);
+
+  async installModrinthPack(serverId, input, options = {}) {
+    const server = this.requireServer(serverId);
+    if (this.runtime.has(serverId) || !['stopped', 'crashed'].includes(server.status)) {
+      throw clientError('Stop and verify the server before importing a modpack.');
+    }
+    if (!['fabric', 'forge', 'neoforge', 'quilt'].includes(server.software)) {
+      throw clientError('Modrinth modpacks require a Fabric, Forge, NeoForge, or Quilt server.');
+    }
+    if (typeof input.versionId !== 'string') throw clientError('Choose a Modrinth modpack version.');
+    checkCancelled(options.signal);
+    options.onProgress?.(5, 'Loading selected Modrinth pack metadata.');
+    const version = await getModrinthVersion(input.versionId, {
+      type: 'modpack', fetchImpl: this.fetch, signal: options.signal
+    });
+    if (!version.gameVersions.includes(server.minecraftVersion)) {
+      throw clientError(`This modpack version does not support Minecraft ${server.minecraftVersion}.`, 422);
+    }
+    if (!version.loaders.some((loader) => loader.replace(/-loader$/, '') === server.software)) {
+      throw clientError(`This modpack version does not support ${server.software}.`, 422);
+    }
+    const packFile = version.files.find((candidate) => candidate.primary) ?? version.files[0];
+    options.onProgress?.(15, 'Downloading the selected Modrinth pack archive.');
+    const packBytes = await downloadVerified({ ...packFile, providerId: 'modrinth' }, {
+      fetchImpl: this.fetch,
+      maxBytes: 64 * 1024 ** 2,
+      signal: options.signal
+    });
+    const pack = await parseModrinthPack(Buffer.from(packBytes), {
+      fetch: this.fetch,
+      signal: options.signal,
+      timeoutMs: 10 * 60 * 1000
+    });
+    if (pack.gameVersion !== server.minecraftVersion) {
+      throw clientError(`This modpack requires Minecraft ${pack.gameVersion}, not ${server.minecraftVersion}.`, 422);
+    }
+    const packLoader = pack.loader?.name.replace(/-loader$/, '');
+    if (packLoader !== server.software) {
+      throw clientError(`This modpack requires ${packLoader ?? 'a different loader'}, not ${server.software}.`, 422);
+    }
+    await this.ensureRconConfiguration(server);
+    const files = new Map([...pack.files].filter(([filename]) =>
+      filename !== 'server.properties' && filename !== 'eula.txt'
+      && filename !== '.panel-rcon-secret' && filename !== 'server.jar'
+    ));
+    options.onProgress?.(85, `Installing ${files.size} verified server pack files.`);
+    const installed = await writeImportedFiles(server.directory, files);
+    this.db.addEvent(serverId, 'success', `Imported verified Modrinth pack ${version.name}.`);
+    options.onProgress?.(100, 'Modpack import complete.');
+    return { installed, name: version.name, gameVersion: pack.gameVersion, loader: pack.loader };
   }
-  return { filename, java_major: javaMajor };
-}
 
-export const install = withServerOperation("installing", installInternal);
+  queueTask(type, serverId, input = {}) {
+    requireObject(input, 'Task options');
+    if (!['install', 'backup', 'restore', 'content-install', 'modpack-install'].includes(type)) throw clientError('Unsupported background task.');
+    if (['install', 'content-install', 'modpack-install'].includes(type) && input.confirmed !== true) throw clientError('Explicit confirmation is required before downloading server software or content.', 403);
+    if (type === 'restore' && input.confirmed !== true) throw clientError('Explicit confirmation is required before replacing server files.', 403);
+    const server = this.requireServer(serverId);
+    if (['install', 'backup', 'restore', 'content-install', 'modpack-install'].includes(type) && this.db.listTasks(1000).some((task) =>
+      task.serverId === serverId && ['queued', 'running', 'cancelling'].includes(task.status))) {
+      throw clientError('Another background operation is already active for this server.', 409);
+    }
+    if (['content-install', 'modpack-install'].includes(type) && !server.installed) {
+      throw clientError('Install the server software before adding content.');
+    }
+    if (['install', 'backup', 'restore', 'content-install', 'modpack-install'].includes(type)
+        && (this.runtime.has(serverId) || !['stopped', 'crashed'].includes(server.status))) {
+      throw clientError('Stop and verify the server before this operation.');
+    }
+    const taskId = randomUUID();
+    const task = this.db.createTask({ id: taskId, type, serverId, createdAt: new Date().toISOString() });
+    const controller = new AbortController();
+    this.taskControllers.set(taskId, controller);
+    const promise = new Promise((resolve) => setImmediate(resolve))
+      .then(() => this.executeTask(taskId, input, controller));
+    this.taskPromises.set(taskId, promise);
+    promise.finally(() => {
+      this.taskControllers.delete(taskId);
+      this.taskPromises.delete(taskId);
+    });
+    return task;
+  }
 
-export function getJob(jobId) {
-  if (typeof jobId !== "string" || !/^[0-9a-f-]{36}$/.test(jobId)) throw new Error("Invalid job identifier");
-  const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
-  if (!job) throw new Error("Job not found");
-  return job;
-}
-
-export function queueInstall(serverId) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (operationState.has(serverId)) throw new Error(`Cannot install while ${operationState.get(serverId)} is in progress`);
-  const jobId = randomUUID();
-  const controller = new AbortController();
-  db.prepare("INSERT INTO jobs(id,server_id,type,status,message) VALUES(?,?,?,'queued','Waiting to install server software')")
-    .run(jobId, serverId, "install");
-  jobControllers.set(jobId, controller);
-  operationState.set(serverId, "installing");
-  setImmediate(async () => {
-    if (controller.signal.aborted) {
-      db.prepare("UPDATE jobs SET status = 'cancelled', message = 'Installation cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .run(jobId);
-      jobControllers.delete(jobId);
-      if (operationState.get(serverId) === "installing") operationState.delete(serverId);
+  async executeTask(taskId, input, controller) {
+    const task = this.db.getTask(taskId);
+    if (!task || controller.signal.aborted) {
+      this.db.updateTask(taskId, { status: 'cancelled', message: 'Operation cancelled before it started.' });
       return;
     }
-    db.prepare("UPDATE jobs SET status = 'running', message = 'Downloading and verifying server software', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .run(jobId);
+    this.db.updateTask(taskId, { status: 'running', progress: 1, message: 'Operation started.' });
     try {
-      let lastProgress = -1;
-      let lastUpdate = 0;
-      const result = await installInternal(serverId, {
-        signal: controller.signal,
-        onProgress: (bytes, total, message) => {
-          const progress = total > 0 ? Math.min(99, Math.floor(bytes / total * 100)) : lastProgress;
-          const now = Date.now();
-          if (progress === lastProgress && now - lastUpdate < 1000) return;
-          lastProgress = progress;
-          lastUpdate = now;
-          if (message) {
-            db.prepare(`UPDATE jobs SET progress = ?, message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
-              .run(progress, message, jobId);
-            return;
-          }
-          const downloadedMb = (bytes / 1024 / 1024).toFixed(1);
-          const totalText = total > 0 ? ` of ${(total / 1024 / 1024).toFixed(1)} MB` : "";
-          db.prepare(`UPDATE jobs SET progress = ?, message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
-            .run(progress, `Downloaded ${downloadedMb} MB${totalText}`, jobId);
-        },
+      let result;
+      if (task.type === 'install') {
+        result = await this.install(task.serverId, {
+          ...input,
+          signal: controller.signal,
+          onProgress: (progress, message) => this.db.updateTask(taskId, { progress, message })
+        });
+      } else if (task.type === 'backup') {
+        checkCancelled(controller.signal);
+        this.db.updateTask(taskId, { progress: 10, message: 'Copying stopped server files.' });
+        result = await this.createBackup(task.serverId, { signal: controller.signal });
+      } else {
+        checkCancelled(controller.signal);
+        if (task.type === 'restore') {
+          this.db.updateTask(taskId, { progress: 10, message: 'Validating backup and replacing server files.' });
+          result = await this.restoreBackup(task.serverId, input.backupId, { ...input, signal: controller.signal });
+        } else if (task.type === 'content-install') {
+          this.db.updateTask(taskId, { progress: 10, message: 'Verifying selected Modrinth content.' });
+          result = await this.installModrinthContent(task.serverId, input, {
+            signal: controller.signal,
+            onProgress: (progress, message) => this.db.updateTask(taskId, { progress, message })
+          });
+        } else {
+          result = await this.installModrinthPack(task.serverId, input, {
+            signal: controller.signal,
+            onProgress: (progress, message) => this.db.updateTask(taskId, { progress, message })
+          });
+        }
+      }
+      this.db.updateTask(taskId, {
+        status: 'completed',
+        progress: 100,
+        message: 'Operation completed.',
+        result_json: JSON.stringify(result),
+        error: null
       });
-      db.prepare(`UPDATE jobs SET status = 'completed', progress = 100, message = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?`).run(`Installed ${result.filename ?? "server runtime"}`, jobId);
     } catch (error) {
-      const cancelled = controller.signal.aborted || error.name === "AbortError";
-      db.prepare(`UPDATE jobs SET status = ?, error = ?, message = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?`).run(
-        cancelled ? "cancelled" : "failed",
-        error.message,
-        cancelled ? "Installation cancelled" : "Installation failed",
-        jobId,
-      );
-    } finally {
-      jobControllers.delete(jobId);
-      if (operationState.get(serverId) === "installing") operationState.delete(serverId);
+      const cancelled = controller.signal.aborted || error.name === 'AbortError';
+      this.db.updateTask(taskId, {
+        status: cancelled ? 'cancelled' : 'failed',
+        message: cancelled ? 'Operation cancelled.' : 'Operation failed.',
+        error: safeMessage(error)
+      });
+      if (!cancelled) this.db.addEvent(task.serverId, 'error', `Background ${task.type} failed: ${safeMessage(error)}`);
     }
-  });
-  return getJob(jobId);
-}
-
-export function retryJob(jobId) {
-  const job = getJob(jobId);
-  if (job.type !== "install" || !["failed", "interrupted", "cancelled"].includes(job.status)) {
-    throw new Error("Only a failed, interrupted, or cancelled server installation can be retried");
   }
-  return queueInstall(job.server_id);
-}
 
-export function cancelJob(jobId) {
-  const job = getJob(jobId);
-  if (job.type !== "install" || !["queued", "running"].includes(job.status)) {
-    throw new Error("Only a queued or running server installation can be cancelled");
+  cancelTask(id) {
+    const task = this.db.getTask(id);
+    if (!task) throw clientError('Task not found.', 404);
+    if (task.status !== 'queued' && task.status !== 'running') {
+      throw clientError('Only queued or running tasks can be cancelled.', 409);
+    }
+    this.taskControllers.get(id)?.abort();
+    return this.db.updateTask(id, { status: 'cancelling', message: 'Cancellation requested.' });
   }
-  const controller = jobControllers.get(jobId);
-  if (!controller) throw new Error("This job is not active in the current panel process");
-  controller.abort();
-  return getJob(jobId);
-}
 
-export async function acceptEula(serverId, accepted) {
-  if (operationState.has(serverId)) throw new Error(`Cannot accept the EULA while ${operationState.get(serverId)} is in progress`);
-  if (accepted !== true) throw new Error("Explicitly accept the Minecraft EULA to enable starting this server");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  const directory = await serverDirectory(serverId);
-  await fs.writeFile(path.join(directory, "eula.txt"), "# Accepted explicitly in Minecraft Server Control Panel\neula=true\n", { mode: 0o600 });
-  db.prepare("UPDATE servers SET eula_accepted = 1 WHERE id = ?").run(serverId);
-  return getServer(serverId);
-}
-
-function trackLog(instance, chunk) {
-  const text = chunk.toString("utf8");
-  instance.logBuffer += text;
-  if (instance.logBuffer.length > 30000) instance.logBuffer = instance.logBuffer.slice(-20000);
-  const lines = (instance.pendingText + text).split(/\r?\n/);
-  instance.pendingText = lines.pop().slice(-4096);
-  for (const line of lines) {
-    if (/\] \[Server thread\/INFO\].*Done \(/.test(line) ||
-        (instance.loader === "bedrock" && /\bServer started\b/i.test(line))) {
-      instance.status = "running";
-      db.prepare("UPDATE servers SET restart_count = 0, last_started_at = CURRENT_TIMESTAMP WHERE id = ?").run(instance.serverId);
-    }
-    const joined = /: ([A-Za-z0-9_]{1,16}) joined the game/.exec(line);
-    const left = /: ([A-Za-z0-9_]{1,16}) left the game/.exec(line);
-    if (joined) {
-      instance.playersKnown = true;
-      instance.players.add(joined[1]);
-    }
-    if (left) {
-      instance.playersKnown = true;
-      instance.players.delete(left[1]);
-    }
-    const tps = /TPS from last [^:]+:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)/i.exec(line);
-    if (tps) instance.tps = tps.slice(1).map(Number);
-    const mspt = /(?:average|avg)[^0-9]*([\d.]+)\s*mspt/i.exec(line);
-    if (mspt) instance.mspt = Number(mspt[1]);
+  listTasks() {
+    return this.db.listTasks();
   }
-  for (const listener of instance.listeners) listener(text);
-}
 
-function supervisorClient(socket, pid = null) {
-  const child = new EventEmitter();
-  child.pendingSupervisorMessages = [];
-  child.pendingSupervisorExit = null;
-  child.pid = pid;
-  child.exitCode = null;
-  child.signalCode = null;
-  child.stdin = {
-    destroyed: false,
-    get writable() { return !this.destroyed && socket.writable; },
-    write(text, callback) {
-      if (this.destroyed || !socket.writable) {
-        const error = new Error("Server console connection is unavailable");
-        callback?.(error);
-        return false;
-      }
-      const accepted = socket.write(`${JSON.stringify({ type: "command", command: text })}\n`, callback);
-      return accepted;
-    },
-  };
-  child.kill = (signal = "SIGTERM") => {
-    if (!socket.destroyed) socket.write(`${JSON.stringify({ type: "signal", signal })}\n`);
-    return true;
-  };
-  child.socket = socket;
-  child.dispatchSupervisorMessage = (message) => {
-    if (child.listenerCount("message")) child.emit("message", message);
-    else child.pendingSupervisorMessages.push(message);
-  };
-  child.dispatchSupervisorExit = (code, signal) => {
-    child.exitCode = code;
-    child.signalCode = signal;
-    child.stdin.destroyed = true;
-    if (child.listenerCount("close")) child.emit("close", code, signal);
-    else child.pendingSupervisorExit = { code, signal };
-  };
-  child.flushSupervisorEvents = () => {
-    for (const message of child.pendingSupervisorMessages.splice(0)) child.emit("message", message);
-    if (child.pendingSupervisorExit) {
-      const { code, signal } = child.pendingSupervisorExit;
-      child.pendingSupervisorExit = null;
-      child.emit("close", code, signal);
+  getTask(id) {
+    const task = this.db.getTask(id);
+    if (!task) throw clientError('Task not found.', 404);
+    return task;
+  }
+
+  createSchedule(serverId, input) {
+    requireObject(input, 'Schedule');
+    this.requireServer(serverId);
+    const action = input.action;
+    if (!['backup', 'start', 'stop', 'restart'].includes(action)) {
+      throw clientError('Schedule action must be backup, start, stop, or restart.');
     }
-  };
-  return child;
-}
+    const intervalMinutes = Number(input.intervalMinutes);
+    if (!Number.isInteger(intervalMinutes) || intervalMinutes < 5 || intervalMinutes > 43200) {
+      throw clientError('Schedule interval must be between 5 minutes and 30 days.');
+    }
+    const createdAt = new Date();
+    const schedule = this.db.createSchedule({
+      id: randomUUID(),
+      serverId,
+      action,
+      intervalMinutes,
+      createdAt: createdAt.toISOString(),
+      nextRunAt: new Date(createdAt.getTime() + intervalMinutes * 60000).toISOString()
+    });
+    this.db.addEvent(serverId, 'success', `Created recurring ${action} schedule (every ${intervalMinutes} minutes).`);
+    return schedule;
+  }
 
-async function connectSupervisor(socketPath, expectedPid) {
-  const socket = await new Promise((resolve, reject) => {
-    let settled = false;
-    let buffer = "";
-    let onData;
-    const connection = net.createConnection(socketPath);
-    const timeout = setTimeout(() => finish(new Error("Timed out connecting to the server process supervisor")), 5000);
-    const finish = (error, result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      if (onData) connection.off("data", onData);
-      if (error) {
-        connection.destroy();
-        reject(error);
-      } else resolve(result);
-    };
-    connection.setEncoding("utf8");
-    connection.once("error", (error) => finish(error));
-    onData = (chunk) => {
-      buffer = (buffer + chunk).slice(-40000);
-      let newline;
-      while ((newline = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        let message;
+  listSchedules(serverId = null) {
+    return this.db.listSchedules(serverId);
+  }
+
+  deleteSchedule(id) {
+    if (!this.db.deleteSchedule(id)) throw clientError('Schedule not found.', 404);
+    return { deleted: true };
+  }
+
+  getMetrics(serverId, limit = 1440) {
+    this.requireServer(serverId);
+    const count = Number(limit);
+    if (!Number.isInteger(count) || count < 1 || count > 1440) throw clientError('Metric limit must be 1-1440.');
+    return this.db.listMetrics(serverId, count);
+  }
+
+  async sampleMetrics() {
+    const capturedAt = new Date().toISOString();
+    const systemTicks = await readSystemCpuTicks();
+    for (const server of this.db.listServers()) {
+      let cpuPercent = null;
+      let memoryBytes = null;
+      if (server.processPid && server.status === 'running' && await isManagedProcess(server.processPid, server)) {
         try {
-          message = JSON.parse(line);
-        } catch {
-          finish(new Error("Server supervisor returned malformed control data"));
-          return;
+          const processMetrics = await readProcessMetrics(server.processPid);
+          memoryBytes = processMetrics.memoryBytes;
+          const previous = this.metricsSamples.get(server.id);
+          if (previous && previous.pid === server.processPid && systemTicks !== null && previous.systemTicks !== null) {
+            const systemDelta = systemTicks - previous.systemTicks;
+            const processDelta = processMetrics.cpuTicks - previous.processTicks;
+            if (systemDelta > 0 && processDelta >= 0) {
+              cpuPercent = Math.min(os.cpus().length * 100, Math.max(0, processDelta / systemDelta * os.cpus().length * 100));
+            }
+          }
+          this.metricsSamples.set(server.id, {
+            processTicks: processMetrics.cpuTicks,
+            systemTicks,
+            pid: server.processPid
+          });
+        } catch (error) {
+          if (error.code !== 'ENOENT' && error.code !== 'EACCES') throw error;
+          this.metricsSamples.delete(server.id);
         }
-        if (message.type !== "ready") continue;
-        if (!Number.isInteger(message.pid) || (expectedPid && message.pid !== expectedPid) ||
-            typeof message.history !== "string" || message.history.length > 30000) {
-          finish(new Error("Server supervisor identity or recovery data is invalid"));
-          return;
-        }
-        finish(null, { connection, message, buffered: buffer });
-        return;
+      } else {
+        this.metricsSamples.delete(server.id);
       }
-    };
-    connection.on("data", onData);
-  });
-  const child = supervisorClient(socket.connection, socket.message.pid);
-  child.recoveryHistory = socket.message.history;
-  let buffered = socket.buffered;
-  let closedByExit = false;
-  const consume = (chunk) => {
-    buffered = (buffered + chunk).slice(-40000);
-    let newline;
-    while ((newline = buffered.indexOf("\n")) !== -1) {
-      const line = buffered.slice(0, newline);
-      buffered = buffered.slice(newline + 1);
-      let message;
+      let diskBytes = null;
       try {
-        message = JSON.parse(line);
-      } catch {
-        child.emit("message", { type: "error", message: "Server supervisor sent malformed control data" });
+        diskBytes = await directorySize(server.directory);
+      } catch (error) {
+        if (error.code !== 'ENOENT' && error.code !== 'EACCES') throw error;
+      }
+      this.db.addMetrics({ serverId: server.id, capturedAt, cpuPercent, memoryBytes, diskBytes });
+    }
+    this.db.pruneMetrics(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+  }
+
+  async runDueSchedules() {
+    if (this.schedulingActive) return;
+    this.schedulingActive = true;
+    try {
+      const now = new Date();
+      for (const schedule of this.db.listDueSchedules(now.toISOString())) {
+        const runAt = now.toISOString();
+        const nextRunAt = new Date(now.getTime() + schedule.intervalMinutes * 60000).toISOString();
+        this.db.advanceSchedule(schedule.id, runAt, nextRunAt);
+        try {
+          await this.runSchedule(schedule);
+        } catch (error) {
+          this.db.addEvent(schedule.serverId, 'error', `Scheduled ${schedule.action} failed: ${safeMessage(error)}`);
+        }
+      }
+    } finally {
+      this.schedulingActive = false;
+    }
+  }
+
+  async runSchedule(schedule) {
+    const server = this.requireServer(schedule.serverId);
+    if (schedule.action === 'backup') {
+      this.queueTask('backup', server.id);
+      return;
+    }
+    if (schedule.action === 'start') {
+      if (['running', 'starting'].includes(server.status)) return;
+      await this.start(server.id);
+      this.db.addEvent(server.id, 'info', 'Started server from recurring schedule.');
+      return;
+    }
+    if (schedule.action === 'stop') {
+      if (!['running', 'starting'].includes(server.status)) return;
+      await this.stop(server.id);
+      this.db.addEvent(server.id, 'info', 'Requested server stop from recurring schedule.');
+      return;
+    }
+    if (['running', 'starting'].includes(server.status)) await this.stop(server.id);
+    await waitForStatus(() => this.db.getServer(server.id)?.status === 'stopped', 30000);
+    await this.start(server.id);
+    this.db.addEvent(server.id, 'info', 'Restarted server from recurring schedule.');
+  }
+
+  async diagnostics() {
+    const servers = await this.listServers();
+    return {
+      generatedAt: new Date().toISOString(),
+      platform: process.platform,
+      nodeVersion: process.version,
+      serverCount: servers.length,
+      servers: servers.map((server) => {
+        const { javaPath, ...safeServer } = server;
+        return safeServer;
+      }),
+      events: this.events(100),
+      tasks: this.listTasks(),
+      schedules: this.listSchedules(),
+      metrics: Object.fromEntries(servers.map((server) => [server.id, this.getMetrics(server.id, 60)]))
+    };
+  }
+
+  async start(id, input = {}) {
+    requireObject(input, 'Start options');
+    const server = this.requireServer(id);
+    if (!server.installed) throw clientError('Install the server before starting it.');
+    if (this.runtime.has(id)) throw clientError('The server is already running.');
+    if (server.status === 'running' || server.status === 'starting' || server.status === 'stopping') {
+      throw clientError('The server is already running or changing state.');
+    }
+    if (server.status === 'unknown') throw clientError('Confirm that the previous process has stopped before starting this server.');
+    if (server.processPid && server.status === 'orphaned') {
+      if (await isManagedProcess(server.processPid, server)) {
+        throw clientError('This server still has a process from an earlier panel session. Stop that process before starting another.');
+      }
+      this.db.updateServer(id, { status: 'stopped', process_pid: null, error: null });
+    }
+    const inspectedJava = await this.inspectJava(server.javaPath);
+    const requiredMajor = server.requiredJavaMajor ?? requiredJavaMajor(server.minecraftVersion);
+    this.assertJavaCompatibility(inspectedJava, requiredMajor);
+    server.rconPassword = await this.ensureRconConfiguration(server);
+    if (!server.eulaAccepted && input.acceptEula === true) {
+      return this.acceptEulaAndStart(server);
+    }
+    if (!server.eulaAccepted) throw clientError('You must accept the Minecraft EULA before starting this server.', 403);
+    return this.spawnServer(server);
+  }
+
+  async acceptEulaAndStart(server) {
+    await writeFile(path.join(server.directory, 'eula.txt'), 'eula=true\n', { mode: 0o600 });
+    this.db.updateServer(server.id, { eula_accepted: 1 });
+    server.eulaAccepted = true;
+    return this.spawnServer(server);
+  }
+
+  spawnServer(server) {
+    const jarPath = path.join(server.directory, 'server.jar');
+    const memoryArgs = [`-Xms${Math.min(server.memoryMb, 1024)}M`, `-Xmx${server.memoryMb}M`];
+    const launchArgs = ['forge', 'neoforge'].includes(server.software)
+      ? [
+        ...memoryArgs,
+        `@${path.join(server.directory, 'libraries', 'net', server.software === 'forge' ? 'minecraftforge/forge' : 'neoforged/neoforge', server.softwareVersion, 'unix_args.txt')}`,
+        'nogui'
+      ]
+      : [...memoryArgs, '-jar', jarPath, 'nogui'];
+    const child = spawn(server.javaPath, launchArgs, {
+      cwd: server.directory,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
+      windowsHide: true
+    });
+    const runtime = { child, startedAt: Date.now(), rconPassword: server.rconPassword };
+    this.runtime.set(server.id, runtime);
+    this.db.updateServer(server.id, { status: 'starting', process_pid: child.pid ?? null, last_started_at: new Date().toISOString(), error: null });
+    this.db.addEvent(server.id, 'info', `Starting Java process (${server.javaPath}).`);
+    runtime.startupTimer = setTimeout(() => {
+      if (this.runtime.get(server.id) !== runtime || child.exitCode !== null) return;
+      if (this.db.getServer(server.id)?.status !== 'starting') return;
+      const message = 'Server did not report a ready state within 120 seconds.';
+      this.db.updateServer(server.id, { status: 'crashed', error: message });
+      this.db.addEvent(server.id, 'error', message);
+      child.kill('SIGTERM');
+      const forceTimer = setTimeout(() => {
+        if (child.exitCode === null) child.kill('SIGKILL');
+      }, 5000);
+      forceTimer.unref();
+    }, 120000);
+    runtime.startupTimer.unref();
+    const consume = (stream) => stream.on('data', (chunk) => {
+      for (const line of chunk.toString().split(/\r?\n/)) {
+        if (!line) continue;
+        if (/Done \(/.test(line)) {
+          clearTimeout(runtime.startupTimer);
+          this.db.updateServer(server.id, { status: 'running', error: null });
+        }
+        this.db.addEvent(server.id, /error|exception|failed/i.test(line) ? 'error' : 'console', line.slice(0, 1000));
+      }
+    });
+    consume(child.stdout);
+    consume(child.stderr);
+    child.on('error', (error) => {
+      clearTimeout(runtime.startupTimer);
+      this.runtime.delete(server.id);
+      this.db.updateServer(server.id, { status: 'crashed', process_pid: null, error: safeMessage(error), last_stopped_at: new Date().toISOString() });
+      this.db.addEvent(server.id, 'error', `Unable to start Java: ${safeMessage(error)}`);
+    });
+    child.on('exit', (code, signal) => {
+      clearTimeout(runtime.startupTimer);
+      this.runtime.delete(server.id);
+      const requestedStop = this.db.getServer(server.id)?.status === 'stopping';
+      const status = code === 0 || requestedStop ? 'stopped' : 'crashed';
+      const error = code === 0 ? null : `Process exited with ${signal ? `signal ${signal}` : `code ${code}`}.`;
+      this.db.updateServer(server.id, { status, process_pid: null, error, last_stopped_at: new Date().toISOString() });
+      this.db.addEvent(server.id, status === 'stopped' ? 'info' : 'error', error ?? 'Server stopped.');
+    });
+    return { status: 'starting', pid: child.pid ?? null };
+  }
+
+  async stop(id, force = false) {
+    const runtime = this.runtime.get(id);
+    const server = this.requireServer(id);
+    if (!runtime && server.processPid && server.status === 'orphaned') {
+      if (!await isManagedProcess(server.processPid, server)) {
+        this.db.updateServer(id, { status: 'stopped', process_pid: null, error: null });
+        return { status: 'stopped', server: server.name };
+      }
+      signalProcess(server.processPid, force ? 'SIGKILL' : 'SIGTERM');
+      this.db.updateServer(id, { status: 'stopping' });
+      this.db.addEvent(id, force ? 'warning' : 'info', force
+        ? 'Sent a forced termination signal to the previously running process.'
+        : 'Sent a shutdown signal to the previously running process.');
+      const pid = server.processPid;
+      const timer = setTimeout(() => {
+        isManagedProcess(pid, server).then((stillRunning) => {
+          if (stillRunning) signalProcess(pid, 'SIGKILL');
+        }).catch((error) => console.error(`[manager] Could not verify process ${pid} before escalation:`, error));
+      }, 15000);
+      timer.unref();
+      return { status: 'stopping', server: server.name };
+    }
+    if (!runtime) throw clientError('This server has no active process.');
+    if (runtime.attached) {
+      if (force) {
+        if (await isManagedProcess(server.processPid, server)) signalProcess(server.processPid, 'SIGKILL');
+      } else {
+        await rconCommand({
+          host: '127.0.0.1', port: server.rconPort, password: runtime.rconPassword, command: 'stop'
+        });
+      }
+      this.db.updateServer(id, { status: 'stopping' });
+      this.db.addEvent(id, force ? 'warning' : 'info', force
+        ? 'Requested forced termination of the reattached server process.'
+        : 'Requested graceful shutdown through the local RCON connection.');
+      return { status: 'stopping', server: server.name };
+    }
+    if (!force && runtime.child.exitCode === null) {
+      runtime.child.stdin.write('stop\n');
+      this.db.updateServer(id, { status: 'stopping' });
+      const timeout = setTimeout(() => {
+        if (this.runtime.get(id) !== runtime || runtime.child.exitCode !== null) return;
+        runtime.child.kill('SIGTERM');
+        const killTimeout = setTimeout(() => {
+          if (this.runtime.get(id) === runtime && runtime.child.exitCode === null) runtime.child.kill('SIGKILL');
+        }, 5000);
+        killTimeout.unref();
+      }, 15000);
+      timeout.unref();
+    } else if (runtime.child.exitCode === null) {
+      runtime.child.kill('SIGKILL');
+      this.db.updateServer(id, { status: 'stopping' });
+    }
+    this.db.addEvent(id, force ? 'warning' : 'info', force ? 'Requested process termination.' : 'Requested graceful shutdown.');
+    return { status: force ? 'stopping' : 'stopping', server: server.name };
+  }
+
+  confirmStopped(id, options = {}) {
+    requireObject(options, 'Process-state confirmation');
+    if (options.confirmed !== true) throw clientError('Explicit confirmation is required before changing the process state.', 403);
+    const server = this.requireServer(id);
+    if (server.status !== 'unknown' || server.processPid) {
+      throw clientError('This server does not need manual process-state confirmation.');
+    }
+    this.db.updateServer(id, { status: 'stopped', error: null });
+    this.db.addEvent(id, 'warning', 'User confirmed that no previous server process is running.');
+    return { status: 'stopped' };
+  }
+
+  sendCommand(id, command) {
+    const runtime = this.runtime.get(id);
+    if (typeof command !== 'string' || command.length < 1 || command.length > 256 || /[\r\n\0]/.test(command)) {
+      throw clientError('Commands must be a single line of at most 256 characters.');
+    }
+    if (!runtime || (runtime.child && runtime.child.exitCode !== null)) throw clientError('The server console is not running.');
+    if (runtime.attached) {
+      const server = this.requireServer(id);
+      return rconCommand({
+        host: '127.0.0.1', port: server.rconPort, password: runtime.rconPassword, command
+      }).then((output) => {
+        if (output) this.db.addEvent(id, 'console', output.slice(0, 1000));
+        return { sent: true, output };
+      });
+    }
+    runtime.child.stdin.write(`${command}\n`);
+    return { sent: true };
+  }
+
+  async getLogs(id, after = null) {
+    const server = this.requireServer(id);
+    if (this.runtime.get(id)?.attached) {
+      try {
+        const logStat = await lstat(path.join(server.directory, 'logs', 'latest.log'));
+        if (!logStat.isFile() || logStat.isSymbolicLink() || logStat.size > 2 * 1024 * 1024) {
+          throw clientError('Server log is not a safe regular file or exceeds the 2 MiB limit.', 422);
+        }
+        const text = (await readManagedFile(server.directory, 'logs/latest.log', {
+          maxFileSize: 2 * 1024 * 1024
+        })).toString('utf8');
+        const timestamp = logStat.mtime.toISOString();
+        const previous = this.remoteLogState.get(id);
+        const newLines = previous?.mtimeMs === logStat.mtimeMs && text.startsWith(previous.content)
+          ? text.slice(previous.content.length).split(/\r?\n/)
+          : text.split(/\r?\n/).slice(-500);
+        const added = newLines.filter(Boolean).map((line) => ({
+          timestamp,
+          source: /error|exception|failed/i.test(line) ? 'error' : 'console',
+          line: line.slice(0, 1000)
+        }));
+        const entries = previous?.mtimeMs === logStat.mtimeMs && text.startsWith(previous.content)
+          ? [...previous.entries, ...added].slice(-500)
+          : added;
+        this.remoteLogState.set(id, { mtimeMs: logStat.mtimeMs, content: text, entries });
+        return entries.filter((entry) => !after || entry.timestamp > after);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+    const logs = this.db.listServerLogs(id);
+    return after ? logs.filter((entry) => entry.timestamp > after) : logs.slice(-500);
+  }
+
+  async listServerFiles(id, directory = '') {
+    const server = this.requireServer(id);
+    if (!server.installed) throw clientError('Install the server before browsing its files.');
+    return managedFileOperation(() => listManagedFiles(server.directory, directory));
+  }
+
+  async readServerFile(id, filename) {
+    const server = this.requireServer(id);
+    if (!server.installed) throw clientError('Install the server before browsing its files.');
+    if (filename === '.panel-rcon-secret') throw clientError('Managed RCON credentials are not available through the file manager.', 404);
+    const content = await managedFileOperation(() => readManagedFile(server.directory, filename));
+    if (content.includes(0)) throw clientError('Binary files cannot be opened in the text editor.', 415);
+    let text = content.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(content)) throw clientError('File is not valid UTF-8 text.', 415);
+    if (filename === 'server.properties') text = text.replace(/^rcon\.password=.*$/gm, 'rcon.password=[managed]');
+    return { path: filename, content: text };
+  }
+
+  async writeServerFile(id, filename, content, create = false) {
+    const server = this.requireServer(id);
+    this.assertServerFilesStopped(server);
+    if (typeof content !== 'string') throw clientError('File content must be text.');
+    if (filename === '.panel-rcon-secret') throw clientError('Managed RCON credentials cannot be edited.', 403);
+    const bytes = Buffer.byteLength(content, 'utf8');
+    if (bytes > 2 * 1024 * 1024) throw clientError('Text files are limited to 2 MiB.', 413);
+    const written = await managedFileOperation(() => create
+      ? createManagedFile(server.directory, filename, content)
+      : writeManagedFile(server.directory, filename, content));
+    if (filename === 'server.properties') await this.ensureRconConfiguration(server);
+    this.db.addEvent(id, 'info', `${create ? 'Created' : 'Updated'} server file ${filename}.`);
+    return { written };
+  }
+
+  async deleteServerFile(id, filename) {
+    const server = this.requireServer(id);
+    this.assertServerFilesStopped(server);
+    await managedFileOperation(() => deleteManagedFile(server.directory, filename));
+    this.db.addEvent(id, 'warning', `Deleted server file ${filename}.`);
+    return { deleted: true };
+  }
+
+  assertServerFilesStopped(server) {
+    if (this.runtime.has(server.id) || ['running', 'starting', 'stopping', 'orphaned', 'unknown'].includes(server.status)) {
+      throw clientError('Stop and verify the server before changing its files.');
+    }
+  }
+
+  sendAdminCommand(id, action, args) {
+    const server = this.requireServer(id);
+    if (!['running', 'orphaned'].includes(server.status)) throw clientError('The server must be running to execute Minecraft administration commands.');
+    const executor = createAdminExecutor((command) => this.sendCommand(id, command));
+    return executor(action, args);
+  }
+
+  getUptime(id) {
+    const runtime = this.runtime.get(id);
+    const startedAt = runtime?.attached
+      ? Date.parse(this.db.getServer(id)?.lastStartedAt ?? '')
+      : runtime?.startedAt;
+    return startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
+  }
+
+  async createBackup(id, options = {}) {
+    const server = this.requireServer(id);
+    if (this.runtime.has(id) || ['running', 'starting', 'stopping', 'orphaned', 'unknown'].includes(server.status)) {
+      throw clientError('Stop the server before creating a consistent backup.');
+    }
+    const timestamp = new Date().toISOString().replace(/[^a-z0-9-]/gi, '-').toLowerCase();
+    const backupId = `${id}-${timestamp}-${randomUUID().slice(0, 6)}`;
+    const target = path.join(this.backupDir, `${backupId}.tar.gz`);
+    try {
+      await createArchive(server.directory, target, { signal: options.signal });
+    } catch (error) {
+      await rm(target, { force: true });
+      throw error;
+    }
+    let sizeBytes;
+    let archiveSha256;
+    try {
+      sizeBytes = (await stat(target)).size;
+      archiveSha256 = await sha256File(target);
+    } catch (error) {
+      await rm(target, { force: true });
+      throw error;
+    }
+    const backup = this.db.addBackup({
+      id: backupId, serverId: id, directory: target, archivePath: target, archiveSha256, sizeBytes,
+      createdAt: new Date().toISOString()
+    });
+    await this.applyBackupRetention(id);
+    this.db.addEvent(id, 'success', `Created stopped-server snapshot (${formatBytes(sizeBytes)}).`);
+    return publicBackup(backup);
+  }
+
+  async listBackups(id = null) {
+    const backups = this.db.listBackups(id);
+    return Promise.all(backups.map(async (backup) => {
+      try {
+        if (backup.archive_path) {
+          const archiveStat = await lstat(backup.archive_path);
+          if (!archiveStat.isFile() || archiveStat.isSymbolicLink()) throw clientError('Backup archive is not a regular file.');
+          return publicBackupEntry(backup, archiveStat.size, true);
+        }
+        const actualSize = await directorySize(backup.directory);
+        return publicBackupEntry(backup, actualSize, false);
+      } catch (error) {
+        if (!['ENOENT', 'EACCES', 'ENOTDIR'].includes(error.code)) throw error;
+        return publicBackupEntry(backup, null, Boolean(backup.archive_path), false);
+      }
+    }));
+  }
+
+  async restoreBackup(id, backupId, options = {}) {
+    requireObject(options, 'Restore review');
+    if (options.confirmed !== true) throw clientError('Explicit confirmation is required before replacing server files.', 403);
+    const server = this.requireServer(id);
+    if (this.runtime.has(id) || ['running', 'starting', 'stopping', 'orphaned', 'unknown'].includes(server.status)) {
+      throw clientError('Stop the server before restoring a backup.');
+    }
+    const backup = this.db.listBackups(id).find((item) => item.id === backupId);
+    if (!backup) throw clientError('Backup not found for this server.', 404);
+    if (backup.archive_path) {
+      await this.verifyBackupArchive(backup);
+    } else {
+      const backupStat = await stat(backup.directory).catch(() => null);
+      if (!backupStat?.isDirectory()) throw clientError('Backup files are missing or invalid.', 422);
+    }
+    const staging = `${server.directory}.restore-${randomUUID()}`;
+    try {
+      if (backup.archive_path) {
+        await this.verifyBackupArchive(backup);
+        await extractArchive(backup.archive_path, staging, { signal: options.signal });
+      } else {
+        await copyDirectory(backup.directory, staging, options.signal);
+      }
+    } catch (error) {
+      await rm(staging, { recursive: true, force: true });
+      throw error;
+    }
+    checkCancelled(options.signal);
+    const backupBeforeRestore = `${server.directory}.before-restore-${randomUUID()}`;
+    const { rename } = await import('node:fs/promises');
+    await rename(server.directory, backupBeforeRestore);
+    try {
+      await rename(staging, server.directory);
+      await rm(backupBeforeRestore, { recursive: true, force: true });
+    } catch (error) {
+      await rename(backupBeforeRestore, server.directory);
+      await rm(staging, { recursive: true, force: true });
+      throw error;
+    }
+    this.db.updateServer(id, { installed: 1 });
+    this.db.addEvent(id, 'warning', `Restored backup ${backupId}.`);
+    return { restored: true };
+  }
+
+  async verifyBackupArchive(backup) {
+    if (!backup.archive_path || !/^[a-f0-9]{64}$/.test(backup.archive_sha256 ?? '')) {
+      throw clientError('Backup archive is missing its integrity metadata.', 422);
+    }
+    const info = await lstat(backup.archive_path);
+    if (!info.isFile() || info.isSymbolicLink()) throw clientError('Backup archive is not a regular file.', 422);
+    const actual = await sha256File(backup.archive_path);
+    if (actual !== backup.archive_sha256) throw clientError('Backup archive failed SHA-256 integrity verification.', 422);
+    return { path: backup.archive_path, sizeBytes: info.size, sha256: actual };
+  }
+
+  async deleteBackup(id) {
+    const backup = this.db.listBackups().find((item) => item.id === id);
+    if (!backup) throw clientError('Backup not found.', 404);
+    const target = backup.archive_path ?? backup.directory;
+    const info = await lstat(target).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+    if (info?.isDirectory()) await rm(target, { recursive: true, force: true });
+    else await rm(target, { force: true });
+    this.db.deleteBackup(id);
+    return { deleted: true };
+  }
+
+  async getBackupDownload(id) {
+    const backup = this.db.listBackups().find((item) => item.id === id);
+    if (!backup) throw clientError('Backup not found.', 404);
+    if (!backup.archive_path) throw clientError('This legacy backup has no downloadable archive.', 409);
+    const integrity = await this.verifyBackupArchive(backup);
+    return { ...integrity, filename: `${backup.id}.tar.gz` };
+  }
+
+  async applyBackupRetention(serverId) {
+    const backups = this.db.listBackups(serverId);
+    for (const backup of backups.slice(this.backupRetention)) {
+      const target = backup.archive_path ?? backup.directory;
+      const info = await lstat(target).catch((error) => error.code === 'ENOENT' ? null : Promise.reject(error));
+      if (info?.isDirectory()) await rm(target, { recursive: true, force: true });
+      else await rm(target, { force: true });
+      this.db.deleteBackup(backup.id);
+    }
+  }
+
+  async deleteServer(id, options = {}) {
+    requireObject(options, 'Deletion review');
+    if (options.confirmed !== true) throw clientError('Explicit confirmation is required before deleting server files.', 403);
+    const server = this.requireServer(id);
+    if (this.db.listTasks(1000).some((task) => task.serverId === id && ['queued', 'running', 'cancelling'].includes(task.status))) {
+      throw clientError('Wait for the server operation to finish before deleting this instance.', 409);
+    }
+    if (this.runtime.has(id) || ['running', 'starting', 'stopping', 'orphaned', 'unknown'].includes(server.status)) {
+      throw clientError('Stop the server before deleting it.');
+    }
+    await rm(server.directory, { recursive: true, force: true });
+    this.db.deleteServer(id);
+    this.db.addEvent(null, 'warning', `Deleted server ${server.name} and its files.`);
+    return { deleted: true };
+  }
+
+  async shutdown() {
+    clearInterval(this.reconcileInterval);
+    clearInterval(this.schedulerTimer);
+    clearInterval(this.metricsTimer);
+    clearTimeout(this.initialMetricsTimer);
+    for (const controller of this.taskControllers.values()) controller.abort();
+    await Promise.all(this.taskPromises.values());
+    const active = [...this.runtime.entries()];
+    for (const [id, runtime] of active) {
+      if (runtime.attached) {
+        const server = this.db.getServer(id);
+        if (!server || !await isManagedProcess(server.processPid, server)) continue;
+        this.db.updateServer(id, { status: 'stopping' });
+        try {
+          await rconCommand({
+            host: '127.0.0.1', port: server.rconPort,
+            password: runtime.rconPassword, command: 'stop'
+          });
+        } catch (error) {
+          this.db.addEvent(id, 'warning', `RCON shutdown failed; sending a process signal: ${safeMessage(error)}`);
+          signalProcess(server.processPid, 'SIGTERM');
+        }
         continue;
       }
-      if (message.type === "exit") {
-        closedByExit = true;
-        child.dispatchSupervisorExit(message.code, message.signal);
-      } else {
-        child.dispatchSupervisorMessage(message);
-      }
-    }
-  };
-  socket.connection.on("data", consume);
-  socket.connection.once("close", () => {
-    child.stdin.destroyed = true;
-    child.emit("disconnect", closedByExit);
-  });
-  if (buffered) consume("");
-  return child;
-}
-
-async function launchSupervisor(server, directory, marker) {
-  const runtime = path.join(dataDir, "run");
-  await fs.mkdir(runtime, { recursive: true, mode: 0o700 });
-  await fs.chmod(runtime, 0o700);
-  const socketPath = path.join(runtime, `${server.id}.sock`);
-  await fs.rm(socketPath, { force: true });
-  const executable = marker.executable
-    ? path.join(directory, marker.executable)
-    : server.java_path;
-  const javaArgs = marker.java_args ?? (marker.executable ? marker.args ?? [] : ["-jar", marker.jar, "nogui"]);
-  const args = marker.executable ? javaArgs : [
-    `-Xms${server.min_memory_mb}M`, `-Xmx${server.max_memory_mb}M`, ...javaArgs,
-  ];
-  const configuration = {
-    socketPath, cwd: directory, logPath: path.join(directory, "logs", "panel-console.log"),
-    command: executable, args,
-    ...(marker.executable ? { env: { LD_LIBRARY_PATH: directory } } : {}),
-  };
-  const supervisor = spawn(process.execPath, [supervisorPath, JSON.stringify(configuration)], {
-    cwd: directory, stdio: "ignore", detached: true, shell: false,
-  });
-  supervisor.unref();
-  supervisor.once("error", (error) => console.error(`Could not start process supervisor for ${server.id}:`, error));
-  const deadline = Date.now() + 5000;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const child = await connectSupervisor(socketPath, null);
-      return child;
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-  supervisor.kill("SIGTERM");
-  throw new Error(`Could not connect to server process supervisor: ${lastError?.message ?? "timed out"}`);
-}
-
-function watchManagedProcess(server, child, recovered = false) {
-  const instance = {
-    child, serverId: server.id, loader: server.loader, status: "starting",
-    startedAt: recovered && server.last_started_at ? Date.parse(`${server.last_started_at.replace(" ", "T")}Z`) : Date.now(),
-    players: new Set(), playersKnown: false, pendingText: "",
-    memoryMb: null, cpuPercent: null, tps: null, mspt: null, lastExitCode: null,
-    logBuffer: "", listeners: new Set(), cpuPrevious: null, stopRequested: false,
-  };
-  instances.set(server.id, instance);
-  child.on("message", (message) => {
-    if (message.type === "log" && typeof message.text === "string") {
-      trackLog(instance, Buffer.from(message.text));
-    } else if (message.type === "error") {
-      console.error(`Server process error for ${server.id}:`, message.message);
-    }
-  });
-  if (child.recoveryHistory) trackLog(instance, Buffer.from(child.recoveryHistory));
-  child.flushSupervisorEvents();
-  child.once("error", (error) => {
-    instance.status = "crashed";
-    instance.lastExitCode = error.message;
-    terminalStates.set(server.id, { status: "crashed", lastExitCode: error.message });
-  });
-  child.once("close", (code, signal) => {
-    instance.status = instance.stopRequested || code === 0 ? "stopped" : "crashed";
-    instance.lastExitCode = code ?? signal;
-    terminalStates.set(server.id, { status: instance.status, lastExitCode: instance.lastExitCode });
-    if (instance.status === "crashed") {
-      db.prepare("INSERT INTO crash_history(server_id,exit_code) VALUES(?,?)").run(server.id, String(instance.lastExitCode));
-    }
-    db.prepare("UPDATE servers SET pid = NULL, process_start_ticks = NULL, process_boot_id = NULL WHERE id = ?")
-      .run(server.id);
-    const serverRecord = serverQuery.get(server.id);
-    if (instance.status === "crashed" && !instance.stopRequested && serverRecord?.auto_restart) {
-      const result = db.prepare(`UPDATE servers SET restart_count = restart_count + 1
-        WHERE id = ? AND restart_count < 3`).run(server.id);
-      if (result.changes) {
-        const timer = setTimeout(() => {
-          startServer(server.id).catch((error) => console.error(`Automatic restart failed for ${server.id}:`, error));
-        }, 5000);
-        timer.unref();
-      } else {
-        console.error(`Automatic restart limit reached for ${server.id}`);
-      }
-    }
-    instance.startedAt = 0;
-    if (instances.get(server.id) === instance) instances.delete(server.id);
-  });
-  child.once("disconnect", (receivedExit) => {
-    if (receivedExit || instances.get(server.id) !== instance) return;
-    instance.status = "orphaned";
-    terminalStates.set(server.id, { status: "orphaned", lastExitCode: null });
-    instances.delete(server.id);
-  });
-  return instance;
-}
-
-async function startServerInternal(serverId) {
-  if (shuttingDown) throw new Error("The panel is shutting down and will not start a server");
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (instances.has(serverId)) throw new Error("Server is already running");
-  if (terminalStates.get(serverId)?.status === "orphaned") {
-    throw new Error("A previously managed process is still running; stop it before starting another instance");
-  }
-  if (!server.eula_accepted) throw new Error("Accept the EULA before starting the server");
-  const directory = await serverDirectory(serverId);
-  const marker = JSON.parse(await fs.readFile(path.join(directory, "server-panel.json"), "utf8").catch(() => "null"));
-  if (typeof marker?.executable === "string" && server.loader === "bedrock") {
-    const executablePath = path.join(directory, marker.executable);
-    const executableStat = await fs.lstat(executablePath);
-    if (path.basename(marker.executable) !== marker.executable ||
-        !/^[A-Za-z0-9._-]{1,128}$/.test(marker.executable) ||
-        !executableStat.isFile() || executableStat.isSymbolicLink() || (executableStat.mode & 0o111) === 0 ||
-        marker.executable !== "bedrock_server" || !Array.isArray(marker.args) || marker.args.length !== 0) {
-      throw new Error("Installed Bedrock server executable is missing or invalid");
-    }
-  } else if (typeof marker?.jar === "string") {
-    const jar = path.join(directory, marker.jar);
-    const jarStat = await fs.lstat(jar);
-    if (path.basename(marker.jar) !== marker.jar || !/^[A-Za-z0-9._-]+\.jar$/.test(marker.jar) ||
-        !jarStat.isFile() || jarStat.isSymbolicLink()) {
-      throw new Error("Installed server jar is missing or invalid");
-    }
-  } else if (validJavaArgFileLaunch(marker?.java_args)) {
-    for (const argument of marker.java_args.filter((value) => value.startsWith("@"))) {
-      const relative = argument.slice(1);
-      const file = resolveRelative(directory, relative);
-      const stat = await fs.lstat(file);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) {
-        throw new Error("Installed Java argument file is missing or invalid");
-      }
-    }
-  } else {
-    throw new Error("Install the server software before starting it");
-  }
-  const javaMajor = Number.isInteger(marker.java_major) && marker.java_major >= 8 && marker.java_major <= 99
-    ? marker.java_major
-    : requiredJavaMajor(server.version);
-  if (server.loader !== "bedrock") await checkJava(server.java_path, javaMajor);
-  if (!await portAvailable(server)) throw new Error(`Port ${server.port} is already in use on ${server.bind_address}`);
-  if (server.loader === "bedrock" && !await udpPortAvailable(server, server.port + 1, true)) {
-    throw new Error(`Bedrock IPv6 port ${server.port + 1} is already in use`);
-  }
-  if (server.crossplay && !await udpPortAvailable(server)) {
-    throw new Error(`Bedrock cross-play UDP port ${server.bedrock_port} is already in use on ${server.bind_address}`);
-  }
-  if (shuttingDown) throw new Error("The panel is shutting down and will not start a server");
-  await fs.mkdir(path.join(directory, "logs"), { recursive: true, mode: 0o700 });
-  let child;
-  try {
-    child = await launchSupervisor(server, directory, marker);
-  } catch (error) {
-    throw error;
-  }
-  try {
-    const bootId = fsSync.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-    const startTicks = processStartTicks(child.pid);
-    db.prepare(`UPDATE servers SET pid = ?, process_start_ticks = ?, process_boot_id = ?
-      WHERE id = ?`).run(child.pid, startTicks, bootId, serverId);
-  } catch (error) {
-    child.kill("SIGTERM");
-    throw new Error(`Could not persist process identity: ${error.message}`);
-  }
-  watchManagedProcess(server, child);
-  terminalStates.set(serverId, { status: "starting", lastExitCode: null });
-  return getServer(serverId);
-}
-
-export const startServer = withServerOperation("starting", startServerInternal);
-
-export async function stopServer(serverId, force = false) {
-  const instance = instances.get(serverId);
-  if (!instance) {
-    const server = serverQuery.get(serverId);
-    if (!server || terminalStates.get(serverId)?.status !== "orphaned" || !processIdentityMatches(server)) {
-      throw new Error("Server is not running");
-    }
-    process.kill(server.pid, force ? "SIGKILL" : "SIGTERM");
-    const deadline = Date.now() + (force ? 3000 : 10000);
-    while (Date.now() < deadline && processIdentityMatches(server)) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    if (processIdentityMatches(server)) {
-      if (!force) {
-        process.kill(server.pid, "SIGKILL");
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-      if (processIdentityMatches(server)) throw new Error("Recovered process did not stop");
-    }
-    db.prepare("UPDATE servers SET pid = NULL, process_start_ticks = NULL, process_boot_id = NULL WHERE id = ?")
-      .run(serverId);
-    terminalStates.set(serverId, { status: "stopped", lastExitCode: null });
-    return true;
-  }
-  const waitForExit = (timeoutMs) => new Promise((resolve) => {
-    if (instance.child.exitCode !== null || instance.child.signalCode !== null) return resolve(true);
-    instance.child.once("close", () => resolve(true));
-    setTimeout(() => resolve(false), timeoutMs).unref();
-  });
-  if (force) {
-    instance.status = "stopping";
-    instance.stopRequested = true;
-    instance.child.kill("SIGKILL");
-    await waitForExit(3000);
-  } else {
-    instance.status = "stopping";
-    instance.stopRequested = true;
-    if (!instance.child.stdin.destroyed && instance.child.stdin.writable) instance.child.stdin.write("stop\n");
-    if (!await waitForExit(15000)) {
-      instance.child.kill("SIGTERM");
-      if (!await waitForExit(3000)) {
-        instance.child.kill("SIGKILL");
-        await waitForExit(3000);
-      }
-    }
-  }
-  return true;
-}
-
-export async function restartServer(serverId) {
-  if (!instances.has(serverId)) throw new Error("Server is not running");
-  await stopServer(serverId);
-  if (instances.has(serverId)) throw new Error("The server did not exit; restart was cancelled");
-  return startServer(serverId);
-}
-
-export function sendCommand(serverId, command) {
-  const instance = instances.get(serverId);
-  if (!instance || !["starting", "running"].includes(instance.status)) throw new Error("Server is not accepting commands");
-  if (typeof command !== "string" || !command.trim() || command.length > 2048 || /[\r\n\0]/.test(command)) {
-    throw new Error("Command must be a single line of at most 2048 characters");
-  }
-  return new Promise((resolve, reject) => {
-    instance.child.stdin.write(`${command}\n`, (error) => error ? reject(error) : resolve());
-  });
-}
-
-export async function getLog(serverId) {
-  const instance = instances.get(serverId);
-  if (instance?.logBuffer) return instance.logBuffer;
-  const directory = await serverDirectory(serverId);
-  const filename = path.join(directory, "logs", "panel-console.log");
-  try {
-    const file = await fs.open(filename, "r");
-    try {
-      const { size } = await file.stat();
-      const length = Math.min(size, 128 * 1024);
-      const buffer = Buffer.alloc(length);
-      await file.read(buffer, 0, length, size - length);
-      return buffer.toString("utf8");
-    } finally {
-      await file.close();
-    }
-  } catch (error) {
-    if (error.code === "ENOENT") return "";
-    throw error;
-  }
-}
-
-export function subscribe(serverId, listener) {
-  const instance = instances.get(serverId);
-  if (!instance) return () => {};
-  instance.listeners.add(listener);
-  return () => instance.listeners.delete(listener);
-}
-
-function processMetrics(pid) {
-  try {
-    const status = requireRead(`/proc/${pid}/status`);
-    const rss = /^VmRSS:\s+(\d+)/m.exec(status);
-    const stat = requireRead(`/proc/${pid}/stat`);
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-    const ticks = Number(fields[11]) + Number(fields[12]);
-    const previous = metrics.get(pid);
-    const now = Date.now();
-    const cpuPercent = previous ? Math.max(0, (ticks - previous.ticks) / (now - previous.time) * 100000 / os.cpus().length) : 0;
-    metrics.set(pid, { ticks, time: now });
-    return { memoryMb: rss ? Math.round(Number(rss[1]) / 1024) : null, cpuPercent: Math.round(cpuPercent * 10) / 10 };
-  } catch {
-    return { memoryMb: null, cpuPercent: null };
-  }
-}
-
-const metrics = new Map();
-function requireRead(filename) {
-  return fsSync.readFileSync(filename, "utf8");
-}
-
-setInterval(() => {
-  for (const instance of instances.values()) {
-    if (instance.child.pid) Object.assign(instance, processMetrics(instance.child.pid));
-  }
-}, 3000).unref();
-
-let metricsSampleRunning = false;
-setInterval(async () => {
-  if (metricsSampleRunning) return;
-  metricsSampleRunning = true;
-  try {
-    for (const server of serversQuery.all()) {
-      const instance = instances.get(server.id);
-      const diskBytes = await diskUsage(await serverDirectory(server.id));
-      db.prepare(`INSERT INTO metrics_history(server_id,cpu_percent,memory_mb,disk_bytes,players,tps_1m,mspt)
-        VALUES(?,?,?,?,?,?,?)`).run(
-        server.id,
-        instance?.cpuPercent ?? null,
-        instance?.memoryMb ?? null,
-        diskBytes,
-        instance?.playersKnown ? instance.players.size : null,
-        instance?.tps?.[0] ?? null,
-        instance?.mspt ?? null,
-      );
-      db.prepare(`DELETE FROM metrics_history WHERE server_id = ? AND id NOT IN
-        (SELECT id FROM metrics_history WHERE server_id = ? ORDER BY id DESC LIMIT 43200)`).run(server.id, server.id);
-    }
-  } catch (error) {
-    console.error("Could not sample server metrics:", error);
-  } finally {
-    metricsSampleRunning = false;
-  }
-}, 60000).unref();
-
-async function createBackupInternal(serverId) {
-  const server = serverQuery.get(serverId);
-  if (!server) throw new Error("Server not found");
-  if (instances.has(serverId)) throw new Error("Stop the server before creating a consistent backup");
-  const directory = await serverDirectory(serverId);
-  const backups = await serverBackupDirectory(serverId, true);
-  const id = randomUUID();
-  const filename = `${serverId}-${id}.tar.gz`;
-  const destination = path.join(backups, filename);
-  const child = spawn("tar", ["-czf", destination, "--", "."], {
-    cwd: directory, stdio: ["ignore", "ignore", "pipe"], shell: false,
-  });
-  let errorOutput = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => (errorOutput += chunk));
-  const exitCode = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", resolve);
-  });
-  if (exitCode !== 0) {
-    await fs.rm(destination, { force: true });
-    throw new Error(`Backup failed: ${errorOutput.trim() || `tar exited with ${exitCode}`}`);
-  }
-  db.prepare("INSERT INTO backups(id,server_id,filename) VALUES(?,?,?)").run(id, serverId, filename);
-  return { id, filename, created_at: new Date().toISOString() };
-}
-
-export const createBackup = withServerOperation("backing up", createBackupInternal);
-
-export function listBackups(serverId) {
-  if (!serverQuery.get(serverId)) throw new Error("Server not found");
-  return db.prepare("SELECT id, filename, created_at FROM backups WHERE server_id = ? ORDER BY created_at DESC, rowid DESC").all(serverId);
-}
-
-export async function getBackupDownload(serverId, backupId) {
-  if (!serverQuery.get(serverId)) throw new Error("Server not found");
-  const backup = db.prepare("SELECT filename FROM backups WHERE id = ? AND server_id = ?").get(backupId, serverId);
-  if (!backup || path.basename(backup.filename) !== backup.filename) throw new Error("Backup not found");
-  const directory = await serverBackupDirectory(serverId);
-  const filename = path.join(directory, backup.filename);
-  const stat = await fs.lstat(filename);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Backup file is invalid");
-  return { path: filename, filename: backup.filename, size: stat.size };
-}
-
-export function setBackupSchedule(serverId, intervalHours, retentionCount, enabled = true) {
-  if (!serverQuery.get(serverId)) throw new Error("Server not found");
-  if (!Number.isInteger(intervalHours) || intervalHours < 1 || intervalHours > 720 ||
-      !Number.isInteger(retentionCount) || retentionCount < 1 || retentionCount > 100 ||
-      typeof enabled !== "boolean") throw new Error("Backup schedule requires 1-720 hours, 1-100 retained backups, and a boolean enabled value");
-  const nextRun = new Date(Date.now() + intervalHours * 3600000).toISOString();
-  db.prepare(`INSERT INTO backup_schedules(server_id,interval_hours,retention_count,enabled,next_run_at)
-    VALUES(?,?,?,?,?) ON CONFLICT(server_id) DO UPDATE SET interval_hours=excluded.interval_hours,
-    retention_count=excluded.retention_count, enabled=excluded.enabled, next_run_at=excluded.next_run_at`)
-    .run(serverId, intervalHours, retentionCount, Number(enabled), nextRun);
-  return getBackupSchedule(serverId);
-}
-
-export function getBackupSchedule(serverId) {
-  if (!serverQuery.get(serverId)) throw new Error("Server not found");
-  const schedule = db.prepare("SELECT * FROM backup_schedules WHERE server_id = ?").get(serverId);
-  return schedule ? { ...schedule, enabled: Boolean(schedule.enabled) } : null;
-}
-
-async function applyBackupRetention(serverId, count) {
-  const records = listBackups(serverId);
-  for (const backup of records.slice(count)) {
-    const directory = await serverBackupDirectory(serverId);
-    const filename = path.join(directory, backup.filename);
-    const stat = await fs.lstat(filename);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Refusing to remove an invalid backup file");
-    await fs.rm(filename);
-    db.prepare("DELETE FROM backups WHERE id = ? AND server_id = ?").run(backup.id, serverId);
-  }
-}
-
-let scheduleCheckRunning = false;
-export async function runScheduledBackups(now = new Date()) {
-  if (scheduleCheckRunning) return;
-  scheduleCheckRunning = true;
-  try {
-    const due = db.prepare(`SELECT server_id, interval_hours, retention_count FROM backup_schedules
-      WHERE enabled = 1 AND next_run_at <= ?`).all(now.toISOString());
-    for (const schedule of due) {
-      const nextRun = new Date(now.getTime() + schedule.interval_hours * 3600000).toISOString();
-      db.prepare("UPDATE backup_schedules SET next_run_at = ? WHERE server_id = ?").run(nextRun, schedule.server_id);
-      if (instances.has(schedule.server_id) || operationState.has(schedule.server_id)) continue;
+      if (runtime.child.exitCode !== null) continue;
+      this.db.updateServer(id, { status: 'stopping' });
       try {
-        await createBackup(schedule.server_id);
-        await applyBackupRetention(schedule.server_id, schedule.retention_count);
-      } catch (error) {
-        console.error(`Scheduled backup failed for ${schedule.server_id}:`, error);
+        runtime.child.stdin.write('stop\n');
+      } catch {
+        runtime.child.kill('SIGTERM');
       }
     }
-  } catch (error) {
-    console.error("Could not check scheduled backups:", error);
-  } finally {
-    scheduleCheckRunning = false;
-  }
-}
-
-setInterval(() => {
-  runScheduledBackups().catch((error) => console.error("Scheduled backup runner failed:", error));
-}, 30000).unref();
-
-function serverSettingsFromProperties(serverId, content) {
-  const properties = Object.fromEntries(content.split(/\r?\n/)
-    .filter((line) => line && !line.startsWith("#"))
-    .map((line) => {
-      const separator = line.indexOf("=");
-      return separator < 0 ? [line, ""] : [line.slice(0, separator), line.slice(separator + 1)];
+    await Promise.all(active.map(async ([id, runtime]) => {
+      if (runtime.attached) {
+        const server = this.db.getServer(id);
+        if (!server?.processPid) return;
+        const deadline = Date.now() + 20000;
+        while (Date.now() < deadline && await isManagedProcess(server.processPid, server)) {
+          if (Date.now() >= deadline - 5000) signalProcess(server.processPid, 'SIGTERM');
+          if (Date.now() >= deadline - 1000) signalProcess(server.processPid, 'SIGKILL');
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        return;
+      }
+      const child = runtime.child;
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      const gracefulTimeout = setTimeout(() => {
+        if (child.exitCode === null) child.kill('SIGTERM');
+      }, 15000);
+      const forceTimeout = setTimeout(() => {
+        if (child.exitCode === null) child.kill('SIGKILL');
+      }, 19000);
+      gracefulTimeout.unref();
+      forceTimeout.unref();
+      await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 20000))]);
+      clearTimeout(gracefulTimeout);
+      clearTimeout(forceTimeout);
     }));
-  const server = serverQuery.get(serverId);
-  const port = properties["server-port"] === undefined ? server.port : Number(properties["server-port"]);
-  const bedrockIpv6Port = properties["server-portv6"] === undefined ? port + 1 : Number(properties["server-portv6"]);
-  const maxPlayers = properties["max-players"] === undefined ? server.max_players : Number(properties["max-players"]);
-  const configuredAddress = properties["server-ip"];
-  const bindAddress = configuredAddress === undefined ? server.bind_address : configuredAddress.trim() || "0.0.0.0";
-  const onlineModeText = properties["online-mode"];
-  const onlineMode = onlineModeText === undefined ? Boolean(server.online_mode) :
-    onlineModeText === "true" ? true : onlineModeText === "false" ? false : null;
-  const viewDistance = properties["view-distance"] === undefined ? server.view_distance : Number(properties["view-distance"]);
-  const distanceKey = server.loader === "bedrock" ? "tick-distance" : "simulation-distance";
-  const simulationDistance = properties[distanceKey] === undefined ? server.simulation_distance : Number(properties[distanceKey]);
-  if (!Number.isInteger(port) || port < 1024 || port > (server.loader === "bedrock" ? 65534 : 65535) ||
-      (server.loader === "bedrock" && bedrockIpv6Port !== port + 1) ||
-      !Number.isInteger(maxPlayers) || maxPlayers < 1 || maxPlayers > 1000 ||
-      (bindAddress !== "0.0.0.0" && !net.isIP(bindAddress)) || onlineMode === null ||
-      !Number.isInteger(viewDistance) || viewDistance < 2 || viewDistance > 32 ||
-      !Number.isInteger(simulationDistance) || simulationDistance < 2 ||
-      simulationDistance > (server.loader === "bedrock" ? 12 : 32)) {
-    throw new Error("server.properties contains invalid port, bind address, player limit, online mode, or distance settings");
   }
-  const servicePorts = server.loader === "bedrock"
-    ? [port, bedrockIpv6Port]
-    : [port, ...(server.crossplay ? [server.bedrock_port] : [])];
-  const conflict = findManagedPortConflict(servicePorts, serverId);
-  if (conflict) throw new Error(`Port ${port} is already assigned to server ${conflict.id}`);
-  return { port, bindAddress, maxPlayers, onlineMode, viewDistance, simulationDistance };
-}
 
-async function restoreBackupInternal(serverId, backupId) {
-  if (instances.has(serverId)) throw new Error("Stop the server before restoring a backup");
-  const row = db.prepare("SELECT filename FROM backups WHERE id = ? AND server_id = ?").get(backupId, serverId);
-  if (!row) throw new Error("Backup not found");
-  if (path.basename(row.filename) !== row.filename || !row.filename.endsWith(".tar.gz")) {
-    throw new Error("Backup filename is invalid");
+  requireServer(id) {
+    const server = this.db.getServer(id);
+    if (!server) throw clientError('Server not found.', 404);
+    return server;
   }
-  const directory = await serverDirectory(serverId);
-  const archive = path.join(await serverBackupDirectory(serverId), row.filename);
-  const stat = await fs.lstat(archive);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Backup file is invalid");
-  const listing = spawn("tar", ["-tzf", archive], { stdio: ["ignore", "pipe", "pipe"], shell: false });
-  let archiveEntries = "";
-  let listingError = "";
-  listing.stdout.setEncoding("utf8");
-  listing.stderr.setEncoding("utf8");
-  listing.stdout.on("data", (chunk) => {
-    archiveEntries += chunk;
-    if (archiveEntries.length > 20 * 1024 * 1024) listing.kill("SIGKILL");
-  });
-  listing.stderr.on("data", (chunk) => {
-    listingError = (listingError + chunk).slice(-4096);
-  });
-  const listingCode = await new Promise((resolve, reject) => {
-    listing.once("error", reject);
-    listing.once("close", resolve);
-  });
-  if (listingCode !== 0) throw new Error(`Could not inspect backup archive: ${listingError.trim()}`);
-  const entries = archiveEntries.split("\n").filter(Boolean);
-  if (entries.some((entry) => path.isAbsolute(entry) || entry.split("/").some((part) => part === "..") || entry.includes("\0"))) {
-    throw new Error("Backup contains an unsafe path and cannot be restored");
-  }
-  const typeListing = spawn("tar", ["--quoting-style=escape", "-tvzf", archive], {
-    stdio: ["ignore", "pipe", "pipe"], shell: false,
-  });
-  let entryTypes = "";
-  let typeListingError = "";
-  typeListing.stdout.setEncoding("utf8");
-  typeListing.stderr.setEncoding("utf8");
-  typeListing.stdout.on("data", (chunk) => {
-    entryTypes += chunk;
-    if (entryTypes.length > 20 * 1024 * 1024) typeListing.kill("SIGKILL");
-  });
-  typeListing.stderr.on("data", (chunk) => {
-    typeListingError = (typeListingError + chunk).slice(-4096);
-  });
-  const typeListingCode = await new Promise((resolve, reject) => {
-    typeListing.once("error", reject);
-    typeListing.once("close", resolve);
-  });
-  if (typeListingCode !== 0) throw new Error(`Could not inspect backup entry types: ${typeListingError.trim()}`);
-  if (entryTypes.split("\n").filter(Boolean).some((entry) => !/^[\-d]/.test(entry))) {
-    throw new Error("Backup contains a symbolic link or special file; restore is refused for safety");
-  }
-  const staging = `${directory}.restore-${randomUUID()}`;
-  await fs.mkdir(staging, { mode: 0o700 });
-  const child = spawn("tar", ["-xzf", archive, "--no-same-owner", "-C", staging], {
-    stdio: ["ignore", "ignore", "pipe"], shell: false,
-  });
-  let errorOutput = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => (errorOutput += chunk));
-  let exitCode;
-  try {
-    exitCode = await new Promise((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", resolve);
-    });
-  } catch (error) {
-    await fs.rm(staging, { recursive: true, force: true });
-    throw error;
-  }
-  if (exitCode !== 0) {
-    await fs.rm(staging, { recursive: true, force: true });
-    throw new Error(`Restore failed: ${errorOutput.trim() || `tar exited with ${exitCode}`}`);
-  }
-  let restoredSettings;
-  try {
-    const propertiesPath = path.join(staging, "server.properties");
-    const propertiesStat = await fs.lstat(propertiesPath);
-    if (!propertiesStat.isFile() || propertiesStat.isSymbolicLink() || propertiesStat.size > 1024 * 1024) {
-      throw new Error("Backup server.properties is invalid");
-    }
-    restoredSettings = serverSettingsFromProperties(serverId, await fs.readFile(propertiesPath, "utf8"));
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      await fs.rm(staging, { recursive: true, force: true });
-      throw error;
-    }
-  }
-  const previous = `${directory}.previous-${randomUUID()}`;
-  await fs.rename(directory, previous);
-  try {
-    await fs.rename(staging, directory);
-    if (restoredSettings) {
-      db.prepare(`UPDATE servers SET port = ?, bind_address = ?, max_players = ?, online_mode = ?,
-        view_distance = ?, simulation_distance = ? WHERE id = ?`)
-        .run(restoredSettings.port, restoredSettings.bindAddress, restoredSettings.maxPlayers,
-          Number(restoredSettings.onlineMode), restoredSettings.viewDistance, restoredSettings.simulationDistance, serverId);
-    }
-  } catch (error) {
-    await fs.rm(directory, { recursive: true, force: true });
-    await fs.rename(previous, directory);
-    await fs.rm(staging, { recursive: true, force: true });
-    throw error;
-  }
-  await fs.rm(previous, { recursive: true, force: true });
-}
 
-export const restoreBackup = withServerOperation("restoring", restoreBackupInternal);
+  events(limit = 50) {
+    return this.db.listEvents(limit);
+  }
 
-export async function readServerFiles(serverId, relative = ".") {
-  const directory = await serverDirectory(serverId);
-  const target = resolveRelative(directory, relative);
-  let current = directory;
-  for (const component of path.relative(directory, target).split(path.sep).filter(Boolean)) {
-    current = path.join(current, component);
-    const componentStat = await fs.lstat(current);
-    if (componentStat.isSymbolicLink()) throw new Error("Symbolic links are not accessible");
+  async systemInfo() {
+    const { cpus, freemem, totalmem, platform, release } = await import('node:os');
+    return {
+      platform,
+      release,
+      cpuCount: cpus().length,
+      memoryTotalBytes: totalmem(),
+      memoryFreeBytes: freemem(),
+      serverCount: this.db.listServers().length
+    };
   }
-  const stat = await fs.lstat(target);
-  if (stat.isDirectory()) {
-    const entries = await fs.readdir(target, { withFileTypes: true });
-    return entries.map((entry) => ({
-      name: entry.name,
-      type: entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other",
-    })).sort((a, b) => a.type === b.type ? a.name.localeCompare(b.name) : a.type === "directory" ? -1 : 1);
-  }
-  if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("Only regular text files up to 1 MB can be edited");
-  return { content: await fs.readFile(target, "utf8") };
-}
 
-function resolveRelative(root, relative) {
-  if (typeof relative !== "string" || relative.includes("\0") || path.isAbsolute(relative)) throw new Error("Invalid relative path");
-  const target = path.resolve(root, relative);
-  if (target !== root && !target.startsWith(`${root}${path.sep}`)) throw new Error("Path escapes the server directory");
-  return target;
-}
-
-export async function writeServerFile(serverId, relative, content) {
-  if (operationState.has(serverId)) throw new Error(`Cannot edit files while ${operationState.get(serverId)} is in progress`);
-  const root = await serverDirectory(serverId);
-  const target = resolveRelative(root, relative);
-  if (target === root || typeof content !== "string" || Buffer.byteLength(content) > 1024 * 1024) {
-    throw new Error("File path or content is invalid (maximum file size is 1 MB)");
-  }
-  const parent = path.dirname(target);
-  const relativeParent = path.relative(root, parent);
-  let current = root;
-  for (const component of relativeParent.split(path.sep).filter(Boolean)) {
-    current = path.join(current, component);
-    const stat = await fs.lstat(current);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("File path contains an invalid directory");
-  }
-  try {
-    const currentStat = await fs.lstat(target);
-    if (!currentStat.isFile() || currentStat.isSymbolicLink()) throw new Error("Only regular files can be edited");
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-  const serverProperties = relative === "server.properties";
-  if (serverProperties) {
-    if (instances.has(serverId)) throw new Error("Stop the server before editing server.properties");
-    const settings = serverSettingsFromProperties(serverId, content);
-    await fs.writeFile(target, content, { mode: 0o600 });
-    db.prepare(`UPDATE servers SET port = ?, bind_address = ?, max_players = ?, online_mode = ?,
-      view_distance = ?, simulation_distance = ? WHERE id = ?`)
-      .run(settings.port, settings.bindAddress, settings.maxPlayers, Number(settings.onlineMode),
-        settings.viewDistance, settings.simulationDistance, serverId);
-    return;
-  }
-  await fs.writeFile(target, content, { mode: 0o600 });
-}
-
-async function assertPathNoSymlink(root, target, allowMissingLeaf = false) {
-  let current = root;
-  const components = path.relative(root, target).split(path.sep).filter(Boolean);
-  for (let index = 0; index < components.length; index++) {
-    current = path.join(current, components[index]);
+  async fetchMojang(url, options) {
     try {
-      const stat = await fs.lstat(current);
-      if (stat.isSymbolicLink()) throw new Error("Symbolic links are not accessible");
-      if (index < components.length - 1 && !stat.isDirectory()) throw new Error("A parent path component is not a directory");
+      return await this.fetch(url, { ...options, redirect: 'error' });
     } catch (error) {
-      if (error.code === "ENOENT" && allowMissingLeaf && index === components.length - 1) return;
-      throw error;
+      if (options.signal?.aborted) throw error;
+      if (Number.isInteger(error?.status)) throw error;
+      throw clientError(`Unable to reach Mojang: ${safeMessage(error)}`, 503);
+    }
+  }
+
+  async getJavaCandidates() {
+    if (this.javaCandidates) return this.javaCandidates;
+    const candidates = new Set();
+    if (process.env.JAVA_HOME) candidates.add(path.join(process.env.JAVA_HOME, 'bin', 'java'));
+    for (const directory of (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)) {
+      candidates.add(path.join(directory, 'java'));
+    }
+    candidates.add('/usr/bin/java');
+    candidates.add('/usr/local/bin/java');
+    const home = os.homedir();
+    const roots = [
+      '/usr/lib/jvm', '/usr/java', '/opt/java', '/opt/jdk',
+      path.join(home, '.jdks'),
+      path.join(home, '.sdkman', 'candidates', 'java'),
+      path.join(home, '.local', 'share', 'mise', 'installs', 'java'),
+      path.join(home, '.asdf', 'installs', 'java')
+    ];
+    for (const root of roots) {
+      try {
+        for (const entry of await readdir(root, { withFileTypes: true })) {
+          if (entry.isDirectory() || entry.isSymbolicLink()) candidates.add(path.join(root, entry.name, 'bin', 'java'));
+        }
+      } catch (error) {
+        if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR' && error.code !== 'EACCES') throw error;
+      }
+    }
+    return [...candidates];
+  }
+
+  assertJavaCompatibility(runtime, requiredMajor) {
+    if (!Number.isInteger(requiredMajor)) {
+      throw clientError('The required Java version is unavailable in the Minecraft metadata; compatibility cannot be confirmed.', 422);
+    }
+    if (runtime.majorVersion < requiredMajor) {
+      throw clientError(
+        `Minecraft requires Java ${requiredMajor} or newer, but "${runtime.path}" is Java ${runtime.majorVersion}. Select a compatible Java executable.`,
+        422
+      );
+    }
+  }
+
+  async reconcileOrphanedProcesses() {
+    for (const server of this.db.listServers()) {
+      const runtime = this.runtime.get(server.id);
+      if (!server.processPid || (
+        server.status !== 'orphaned' &&
+        server.status !== 'stopping' &&
+        !(server.status === 'running' && runtime?.attached)
+      )) continue;
+      if (await isManagedProcess(server.processPid, server)) {
+        if (runtime || (this.rconProbeAfter.get(server.id)?.next ?? 0) > Date.now()) continue;
+        const probe = { next: Date.now() + 10000, warned: this.rconProbeAfter.get(server.id)?.warned ?? false };
+        this.rconProbeAfter.set(server.id, probe);
+        try {
+          const secret = await readRconSecret(server.directory);
+          if (!secret || !Number.isInteger(server.rconPort)) continue;
+          await rconCommand({
+            host: '127.0.0.1', port: server.rconPort, password: secret,
+            command: 'list', timeoutMs: 1500
+          });
+          this.runtime.set(server.id, { attached: true, startedAt: null, rconPassword: secret });
+          this.rconProbeAfter.delete(server.id);
+          this.db.updateServer(server.id, { status: 'running', error: null });
+          this.db.addEvent(server.id, 'success', 'Reattached to the verified server process through local RCON.');
+        } catch (error) {
+          if (!probe.warned) {
+            this.db.addEvent(server.id, 'warning', `Could not reattach through RCON: ${safeMessage(error)}`);
+            probe.warned = true;
+          }
+          continue;
+        }
+        continue;
+      }
+      this.runtime.delete(server.id);
+      this.remoteLogState.delete(server.id);
+      this.rconProbeAfter.delete(server.id);
+      this.db.updateServer(server.id, { status: 'stopped', process_pid: null, error: null, last_stopped_at: new Date().toISOString() });
+      this.db.addEvent(server.id, 'info', 'Previously running server process has stopped.');
     }
   }
 }
 
-export async function createServerFile(serverId, relative, type = "file") {
-  if (operationState.has(serverId)) throw new Error(`Cannot create files while ${operationState.get(serverId)} is in progress`);
-  if (!["file", "directory"].includes(type)) throw new Error("Create type must be file or directory");
-  const root = await serverDirectory(serverId);
-  const target = resolveRelative(root, relative);
-  if (target === root) throw new Error("Choose a child path");
-  await assertPathNoSymlink(root, path.dirname(target));
-  if (type === "directory") await fs.mkdir(target, { mode: 0o700 });
-  else {
-    const handle = await fs.open(target, "wx", 0o600);
-    await handle.close();
+function validateText(value, label, min, max) {
+  if (typeof value !== 'string' || value.trim().length < min || value.length > max || /[\0\r\n]/.test(value)) {
+    throw clientError(`${label} must be ${min}-${max} characters and cannot contain newlines.`);
+  }
+  return value.trim();
+}
+
+function requireObject(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw clientError(`${label} must be a JSON object.`);
   }
 }
 
-export async function moveServerFile(serverId, from, to) {
-  if (operationState.has(serverId)) throw new Error(`Cannot move files while ${operationState.get(serverId)} is in progress`);
-  const root = await serverDirectory(serverId);
-  const source = resolveRelative(root, from);
-  const destination = resolveRelative(root, to);
-  if (source === root || destination === root || source === destination ||
-      source === path.join(root, "server.properties")) throw new Error("Source or destination path is invalid");
-  await assertPathNoSymlink(root, source);
-  await assertPathNoSymlink(root, path.dirname(destination));
-  const sourceStat = await fs.lstat(source);
-  if (!sourceStat.isFile() && !sourceStat.isDirectory()) throw new Error("Only regular files and directories can be moved");
+function validateMinecraftVersion(value) {
+  if (typeof value !== 'string' || value.length > 40
+      || !/^[A-Za-z0-9][A-Za-z0-9._+ -]*[A-Za-z0-9]$/.test(value)) {
+    throw clientError('Choose a valid Minecraft version identifier.');
+  }
+  return value;
+}
+
+function requiredJavaMajor(version, metadata = {}) {
+  const declared = metadata.javaVersion?.majorVersion;
+  if (Number.isInteger(declared) && declared >= 8 && declared <= 100) return declared;
+  const match = version.match(/^1\.(\d+)(?:\.|$)/);
+  if (!match) return null;
+  const minor = Number(match[1]);
+  if (minor >= 20 && (minor > 20 || Number(version.match(/^1\.20\.(\d+)/)?.[1] ?? 0) >= 5)) return 21;
+  if (minor >= 18) return 17;
+  if (minor === 17) return 16;
+  return 8;
+}
+
+function checkedMojangUrl(value) {
+  let url;
   try {
-    await fs.lstat(destination);
-    throw new Error("Destination already exists");
+    url = new URL(value);
+  } catch {
+    throw clientError('Mojang supplied an invalid download URL.', 502);
+  }
+  if (url.protocol !== 'https:' || !ALLOWED_DOWNLOAD_HOSTS.has(url.hostname) || url.port || url.username || url.password) {
+    throw clientError('Refusing a download URL outside Mojang distribution hosts.', 502);
+  }
+  return url;
+}
+
+function slugify(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+}
+
+function clientError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+async function managedFileOperation(operation) {
+  try {
+    return await operation();
   } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+    const status = {
+      EACCES: 403,
+      EEXIST: 409,
+      EFBIG: 413,
+      EINVAL: 400,
+      ELOOP: 403,
+      ENOENT: 404,
+      ENOTDIR: 400
+    }[error?.code];
+    if (!status) throw error;
+    throw clientError(error.message, status);
   }
-  if (sourceStat.isDirectory() && destination.startsWith(`${source}${path.sep}`)) {
-    throw new Error("A directory cannot be moved inside itself");
-  }
-  await fs.rename(source, destination);
 }
 
-export async function deleteServerFile(serverId, relative) {
-  if (operationState.has(serverId)) throw new Error(`Cannot delete files while ${operationState.get(serverId)} is in progress`);
-  const root = await serverDirectory(serverId);
-  const source = resolveRelative(root, relative);
-  if (source === root || source === path.join(root, "server.properties")) {
-    throw new Error("The server root and server.properties cannot be deleted");
-  }
-  await assertPathNoSymlink(root, source);
-  const stat = await fs.lstat(source);
-  if (!stat.isFile() && !stat.isDirectory()) throw new Error("Only regular files and directories can be deleted");
-  const trashDirectory = path.join(root, ".panel-trash");
-  await fs.mkdir(trashDirectory, { recursive: true, mode: 0o700 });
-  const trash = path.join(trashDirectory, `${Date.now()}-${randomUUID()}`);
-  await fs.rename(source, trash);
-  return { trashed_as: path.relative(root, trash) };
+function normalizeEcosystemError(error) {
+  if (error?.name !== 'EcosystemError') return error;
+  const clientInputError = new Set([
+    'INVALID_PROVIDER', 'INVALID_IDENTIFIER', 'INVALID_VERSION', 'INVALID_CONTENT_TYPE',
+    'INVALID_QUERY', 'INVALID_LOADER', 'INVALID_PAGINATION'
+  ]).has(error.code);
+  return clientError(error.message, clientInputError ? 400 : 502);
 }
 
-export async function downloadServerFile(serverId, relative) {
-  const root = await serverDirectory(serverId);
-  const target = resolveRelative(root, relative);
-  if (target === root) throw new Error("Choose a file to download");
-  await assertPathNoSymlink(root, target);
-  const stat = await fs.lstat(target);
-  if (!stat.isFile() || stat.size > 512 * 1024 * 1024) throw new Error("Only regular files up to 512 MB can be downloaded");
-  return { path: target, filename: path.basename(target), size: stat.size };
+function safeMessage(error) {
+  return error instanceof Error ? error.message.slice(0, 500) : 'Unknown error';
 }
 
-export async function uploadServerFile(serverId, relative, request) {
-  if (operationState.has(serverId)) throw new Error(`Cannot upload files while ${operationState.get(serverId)} is in progress`);
-  const root = await serverDirectory(serverId);
-  const target = resolveRelative(root, relative);
-  if (target === root || path.basename(target) !== relative.split(/[\\/]/).at(-1) ||
-      Buffer.byteLength(relative) > 1024 || /[\0\r\n]/.test(relative)) {
-    throw new Error("Invalid upload path");
-  }
-  const parent = path.dirname(target);
-  await assertPathNoSymlink(root, parent);
+function publicBackup(backup) {
+  return {
+    id: backup.id,
+    serverId: backup.serverId,
+    sizeBytes: backup.sizeBytes,
+    createdAt: backup.createdAt,
+    archive: Boolean(backup.archivePath),
+    integrity: backup.archiveSha256 ? 'verified-on-use' : 'legacy'
+  };
+}
+
+function publicBackupEntry(backup, sizeBytes, archive, available = true) {
+  return {
+    id: backup.id,
+    server_id: backup.server_id,
+    size_bytes: sizeBytes ?? backup.size_bytes,
+    created_at: backup.created_at,
+    archive,
+    integrity: archive ? 'verified-on-use' : 'legacy',
+    available
+  };
+}
+
+async function sha256File(filename) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(filename)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+async function inspectJava(candidate) {
+  if (typeof candidate !== 'string' || candidate.length === 0 || candidate.length > 512 || /[\0\r\n]/.test(candidate)) return null;
+  let executable = candidate;
   try {
-    await fs.lstat(target);
-    throw new Error("A file already exists at the upload path");
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-  const temporary = path.join(parent, `.upload-${randomUUID()}.part`);
-  const handle = await fs.open(temporary, "wx", 0o600);
-  let size = 0;
-  try {
-    for await (const chunk of request) {
-      size += chunk.length;
-      if (size > 100 * 1024 * 1024) throw new Error("Upload exceeds the 100 MB limit");
-      await handle.write(chunk);
+    if (candidate.includes(path.sep)) {
+      await access(candidate, constants.X_OK);
+      executable = await realpath(candidate);
+    } else {
+      executable = await resolveOnPath(candidate);
+      if (!executable) return null;
     }
-    await handle.close();
-    await fs.rename(temporary, target);
   } catch (error) {
-    await handle.close().catch(() => {});
-    await fs.rm(temporary, { force: true });
+    if (['ENOENT', 'EACCES', 'ENOTDIR'].includes(error.code)) return null;
     throw error;
   }
-  return { filename: path.basename(target), size };
+  const output = await probeJava(executable);
+  if (!output) return null;
+  const match = output.match(/(?:java|openjdk|temurin|zulu|graalvm)(?:\s+version)?\s+["']?((?:1\.)?\d+(?:[._+-][\w.-]+)?)/i)
+    ?? output.match(/version\s+"((?:1\.)?\d+(?:[._+-][\w.-]+)?)"/i);
+  if (!match) return null;
+  const rawVersion = match[1];
+  const majorVersion = Number(rawVersion.startsWith('1.') ? rawVersion.split('.')[1] : rawVersion.split(/[.+_-]/)[0]);
+  if (!Number.isInteger(majorVersion) || majorVersion < 1 || majorVersion > 100) return null;
+  return { path: executable, version: rawVersion, majorVersion };
 }
 
-export async function shutdownServers() {
-  const results = await Promise.allSettled([...instances.keys()].map((id) => stopServer(id)));
-  for (const result of results) {
-    if (result.status === "rejected") console.error("Failed to gracefully stop a managed server:", result.reason);
+async function resolveOnPath(command) {
+  for (const directory of (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(directory, command);
+    try {
+      await access(candidate, constants.X_OK);
+      return await realpath(candidate);
+    } catch (error) {
+      if (!['ENOENT', 'EACCES', 'ENOTDIR'].includes(error.code)) throw error;
+    }
+  }
+  return null;
+}
+
+function probeJava(executable) {
+  return new Promise((resolve, reject) => {
+    let output = '';
+    let settled = false;
+    const child = spawn(executable, ['-version'], { shell: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish(null);
+    }, 3000);
+    timer.unref();
+    const collect = (chunk) => {
+      if (output.length < 8192) output += chunk.toString('utf8').slice(0, 8192 - output.length);
+    };
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    child.once('error', (error) => {
+      if (['ENOENT', 'EACCES', 'ENOEXEC'].includes(error.code)) finish(null);
+      else {
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
+    child.once('close', () => finish(output));
+    function finish(value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    }
+  });
+}
+
+async function copyDirectory(source, destination, signal) {
+  checkCancelled(signal);
+  await mkdir(destination, { recursive: false });
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    checkCancelled(signal);
+    if (entry.isSymbolicLink()) continue;
+    const from = path.join(source, entry.name);
+    const to = path.join(destination, entry.name);
+    if (entry.isDirectory()) await copyDirectory(from, to, signal);
+    else if (entry.isFile()) {
+      await pipeline(createReadStream(from), createWriteStream(to, { flags: 'wx', mode: 0o600 }), ...(signal ? [{ signal }] : []));
+    }
+  }
+}
+
+async function mergeDirectory(source, destination, created = []) {
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    const from = path.join(source, entry.name);
+    const to = path.join(destination, entry.name);
+    const sourceInfo = await lstat(from);
+    if (sourceInfo.isSymbolicLink() || (!sourceInfo.isDirectory() && !sourceInfo.isFile())) {
+      throw clientError('Provider installer produced a symbolic link or special file; refusing to import it.', 422);
+    }
+    let destinationInfo;
+    try {
+      destinationInfo = await lstat(to);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (sourceInfo.isDirectory()) {
+      if (destinationInfo && (!destinationInfo.isDirectory() || destinationInfo.isSymbolicLink())) {
+        throw clientError(`Provider installer output conflicts with existing path "${entry.name}".`, 409);
+      }
+      if (!destinationInfo) {
+        await mkdir(to, { mode: 0o700 });
+        created.push(to);
+      }
+      await mergeDirectory(from, to, created);
+    } else {
+      if (destinationInfo) throw clientError(`Provider installer output would overwrite "${entry.name}".`, 409);
+      await rename(from, to);
+      created.push(to);
+    }
+  }
+  return created;
+}
+
+async function writeImportedFiles(root, files) {
+  if (!(files instanceof Map) || files.size > 4096) throw clientError('Imported content contains an invalid number of files.', 422);
+  const rootInfo = await lstat(root);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw clientError('Server directory is not safe for content installation.', 422);
+  const createdFiles = [];
+  const createdDirectories = [];
+  let totalBytes = 0;
+  try {
+    for (const [relativePath, bytes] of files) {
+      const segments = validateImportedPath(relativePath);
+      if (!Buffer.isBuffer(bytes) && !(bytes instanceof Uint8Array)) {
+        throw clientError('Imported content file has invalid data.', 422);
+      }
+      totalBytes += bytes.byteLength;
+      if (totalBytes > 512 * 1024 ** 2) throw clientError('Imported content exceeds the 512 MiB limit.', 413);
+      let parent = root;
+      for (const segment of segments.slice(0, -1)) {
+        parent = path.join(parent, segment);
+        try {
+          const info = await lstat(parent);
+          if (!info.isDirectory() || info.isSymbolicLink()) throw clientError('Imported content cannot follow an existing link.', 422);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          await mkdir(parent, { mode: 0o700 });
+          createdDirectories.push(parent);
+        }
+      }
+      const target = path.join(parent, segments.at(-1));
+      const noFollow = constants.O_NOFOLLOW ?? 0;
+      const handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
+      createdFiles.push(target);
+      try {
+        await handle.writeFile(bytes);
+      } finally {
+        await handle.close();
+      }
+    }
+    return createdFiles.length;
+  } catch (error) {
+    for (const target of createdFiles.reverse()) await rm(target, { force: true });
+    for (const directory of createdDirectories.reverse()) {
+      await rm(directory, { recursive: false, force: true }).catch((cleanupError) => {
+        if (cleanupError.code !== 'ENOTEMPTY' && cleanupError.code !== 'ENOENT') throw cleanupError;
+      });
+    }
+    throw error;
+  }
+}
+
+function validateImportedPath(value) {
+  if (typeof value !== 'string' || value.length > 1024 || value.startsWith('/') || value.includes('\\') || value.includes('\0')) {
+    throw clientError('Imported content contains an unsafe path.', 422);
+  }
+  const parts = value.split('/');
+  const reserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+  if (parts.length > 16 || parts.some((part) =>
+    !part || part === '.' || part === '..' || part.includes(':') || /[\u0000-\u001f\u007f]/u.test(part)
+      || /[. ]$/u.test(part) || reserved.test(part)
+  )) throw clientError('Imported content contains an unsafe path.', 422);
+  return parts;
+}
+
+function runInstaller(executable, args, cwd, options = {}) {
+  return new Promise((resolve, reject) => {
+    checkCancelled(options.signal);
+    const child = spawn(executable, args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,
+      windowsHide: true
+    });
+    let output = '';
+    let settled = false;
+    let forceTimer;
+    let terminalError;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      clearTimeout(forceTimer);
+      options.signal?.removeEventListener('abort', onAbort);
+    };
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const kill = () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.kill('SIGTERM');
+      forceTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }, 5000);
+      forceTimer.unref();
+    };
+    const onAbort = () => {
+      terminalError = new Error('Provider installation was cancelled.');
+      terminalError.name = 'AbortError';
+      kill();
+    };
+    const timeout = setTimeout(() => {
+      terminalError = clientError('Provider installer exceeded the 10-minute time limit.', 408);
+      kill();
+    }, 10 * 60 * 1000);
+    timeout.unref();
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
+    const collect = (chunk) => {
+      if (output.length < 8192) output = (output + chunk.toString('utf8')).slice(-8192);
+    };
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    child.once('error', (error) => finish(terminalError ?? error));
+    child.once('exit', (code, signal) => {
+      if (terminalError) finish(terminalError);
+      else if (code === 0) finish();
+      else finish(clientError(`Provider installer failed (${signal ? `signal ${signal}` : `exit code ${code}`}): ${output.slice(-1000)}`, 502));
+    });
+  });
+}
+
+function neoForgeVersionPrefix(minecraftVersion) {
+  const match = minecraftVersion.match(/^1\.(\d{1,3})(?:\.(\d{1,3}))?/);
+  if (!match) {
+    const current = minecraftVersion.match(/^(\d{2,3})\.(\d{1,3})/);
+    return current ? `${current[1]}.${current[2]}.` : `${minecraftVersion}.`;
+  }
+  return `${match[1]}.${match[2] ?? '0'}.`;
+}
+
+async function readSystemCpuTicks() {
+  if (process.platform !== 'linux') return null;
+  try {
+    const [line] = (await readFile('/proc/stat', 'utf8')).split('\n');
+    const values = line.trim().split(/\s+/).slice(1).map(Number);
+    return values.slice(0, 8).reduce((sum, value) => sum + value, 0);
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'EACCES') return null;
+    throw error;
+  }
+}
+
+async function readProcessMetrics(pid) {
+  const [statLine, status] = await Promise.all([
+    readFile(`/proc/${pid}/stat`, 'utf8'),
+    readFile(`/proc/${pid}/status`, 'utf8')
+  ]);
+  const fields = statLine.slice(statLine.lastIndexOf(')') + 2).trim().split(/\s+/);
+  const cpuTicks = Number(fields[11]) + Number(fields[12]);
+  const rssMatch = status.match(/^VmRSS:\s+(\d+)\s+kB$/m);
+  const memoryBytes = rssMatch ? Number(rssMatch[1]) * 1024 : null;
+  if (!Number.isFinite(cpuTicks)) throw new Error(`Unable to parse process CPU counters for PID ${pid}.`);
+  return { cpuTicks, memoryBytes };
+}
+
+async function waitForStatus(predicate, timeoutMs) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw clientError('The scheduled server state transition timed out.', 408);
+}
+
+function combineSignals(signal, timeout) {
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function checkCancelled(signal) {
+  if (signal?.aborted) {
+    const error = new Error('Operation was cancelled.');
+    error.name = 'AbortError';
+    throw error;
+  }
+}
+
+async function directorySize(directory) {
+  let total = 0;
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) continue;
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) total += await directorySize(entryPath);
+    else if (entry.isFile()) total += (await stat(entryPath)).size;
+  }
+  return total;
+}
+
+function isPortAvailable(port) {
+  return new Promise((resolve) => {
+    const probe = createNetServer();
+    probe.once('error', () => resolve(false));
+    probe.listen({ port, host: '127.0.0.1', exclusive: true }, () => {
+      probe.close((error) => resolve(!error));
+    });
+  });
+}
+
+async function isManagedProcess(pid, server) {
+  if (!Number.isInteger(pid) || pid < 2 || process.platform !== 'linux') return false;
+  try {
+    const commandLine = await readFile(`/proc/${pid}/cmdline`, 'utf8');
+    if (commandLine.includes(`\0-jar\0${path.join(server.directory, 'server.jar')}\0`)) return true;
+    if (!['forge', 'neoforge'].includes(server.software) || !server.softwareVersion) return false;
+    const argumentFile = server.software === 'forge'
+      ? path.join(server.directory, 'libraries', 'net', 'minecraftforge', 'forge', server.softwareVersion, 'unix_args.txt')
+      : path.join(server.directory, 'libraries', 'net', 'neoforged', 'neoforge', server.softwareVersion, 'unix_args.txt');
+    return commandLine.includes(`\0@${argumentFile}\0`);
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'EACCES') return false;
+    throw error;
+  }
+}
+
+function signalProcess(pid, signal) {
+  try {
+    process.kill(pid, signal);
+  } catch (error) {
+    if (error.code !== 'ESRCH') throw error;
+  }
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function publicServer(server) {
+  const { directory, processPid, rconPort, ...visible } = server;
+  return visible;
+}
+
+async function readRconSecret(directory) {
+  const secretPath = path.join(directory, '.panel-rcon-secret');
+  const noFollow = constants.O_NOFOLLOW ?? 0;
+  const handle = await open(secretPath, constants.O_RDONLY | noFollow);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1 || info.size > 128) {
+      throw clientError('Managed RCON credential file is not a safe regular file.', 422);
+    }
+    const secret = (await handle.readFile('utf8')).trim();
+    if (!/^[A-Za-z0-9_-]{40,60}$/.test(secret)) {
+      throw clientError('Managed RCON credential file contains invalid data.', 422);
+    }
+    return secret;
+  } finally {
+    await handle.close();
   }
 }
