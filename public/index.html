@@ -42,6 +42,20 @@
           <a href="#scheduler" data-page="scheduler" class="nav-item" title="Schedules and metrics"><span class="nav-icon">◴</span>Schedules & metrics</a>
           <a href="#activity" data-page="activity" class="nav-item" title="Activity"><span class="nav-icon">◷</span>Activity</a>
         </nav>
+        <div id="server-navigation" class="server-navigation hidden">
+          <div class="sidebar-label">Current server</div>
+          <div id="server-navigation-name" class="server-navigation-name"></div>
+          <nav id="server-section-navigation" class="navigation" aria-label="Current server sections">
+            <a href="#" data-server-section="overview" class="nav-item"><span class="nav-icon">◫</span>Overview</a>
+            <a href="#" data-server-section="files" class="nav-item"><span class="nav-icon">▤</span>Files</a>
+            <a href="#" data-server-section="mods" class="nav-item"><span class="nav-icon">◈</span>Mods</a>
+            <a href="#" data-server-section="plugins" class="nav-item"><span class="nav-icon">◇</span>Plugins</a>
+            <a href="#" data-server-section="worlds" class="nav-item"><span class="nav-icon">▧</span>Worlds</a>
+            <a href="#" data-server-section="console" class="nav-item"><span class="nav-icon">›_</span>Console</a>
+            <a href="#" data-server-section="logs" class="nav-item"><span class="nav-icon">≡</span>Logs</a>
+          </nav>
+          <a href="#servers" data-page="servers" class="server-nav-back">← All servers</a>
+        </div>
         <div class="sidebar-bottom">
           <div class="local-card"><span class="local-dot"></span><div><strong>Protected access</strong><small>Administrator session active</small></div></div>
           <button id="auth-logout" class="theme-toggle" type="button"><span>↪</span> Sign out</button>
@@ -130,6 +144,25 @@
         <section id="page-activity" class="page" aria-labelledby="activity-title">
           <div class="page-heading"><div><div class="eyebrow">AUDIT TRAIL</div><h1 id="activity-title">Activity</h1><p class="page-description">Recent events reported by the panel and server processes.</p></div><button class="button button-secondary" type="button" data-refresh>↻ <span>Refresh</span></button></div>
           <div id="activity-list" class="event-list event-list-full"></div>
+        </section>
+        <section id="page-server" class="page" aria-labelledby="admin-title">
+          <div class="page-heading server-page-heading">
+            <div><div class="eyebrow">SERVER MANAGEMENT</div><h1 id="admin-title">Manage server</h1><p id="server-page-description" class="page-description"></p></div>
+            <div class="server-page-actions"><span id="server-page-status" class="status-pill"></span><button id="server-page-action" class="button button-primary button-small" type="button"></button><button id="server-page-backup" class="button button-secondary button-small" type="button">Backup</button></div>
+          </div>
+          <div id="server-page-overview" class="manage-panel active">
+            <div class="server-detail-grid">
+              <article class="stat-card"><div class="stat-top">Game version</div><strong id="server-detail-version">—</strong><small id="server-detail-software">—</small></article>
+              <article class="stat-card"><div class="stat-top">Players online</div><strong id="server-detail-players">—</strong><small>Connected players</small></article>
+              <article class="stat-card"><div class="stat-top">Uptime</div><strong id="server-detail-uptime">—</strong><small>Current process session</small></article>
+              <article class="stat-card"><div class="stat-top">Storage used</div><strong id="server-detail-disk">—</strong><small>Server directory</small></article>
+              <article class="stat-card"><div class="stat-top">Server port</div><strong id="server-detail-port">—</strong><small>Java edition port</small></article>
+              <article class="stat-card"><div class="stat-top">Memory limit</div><strong id="server-detail-memory">—</strong><small>Maximum Java heap</small></article>
+            </div>
+            <div class="section-heading"><div><h2>Recent server activity</h2><p>Latest events for this server.</p></div></div>
+            <div id="server-detail-events" class="event-list"></div>
+          </div>
+          <div id="server-page-sections"></div>
         </section>
       </main>
     </div>
