@@ -49,7 +49,8 @@ test('Paper catalog validates vendor project metadata and versions', async () =>
 
 test('Fabric catalogs accept compressed-response length differences and Mojang version identifiers', async () => {
   const catalog = await getProviderCatalog('fabric', {
-    fetchImpl: async (url) => {
+    fetchImpl: async (url, options) => {
+      assert.equal(options.headers['accept-encoding'], 'identity');
       const value = String(url).endsWith('/game')
         ? [
           { version: '1.21.8' },
@@ -301,11 +302,13 @@ test('lists only validated Modrinth project versions with requested filters', as
       assert.equal(parsed.searchParams.get('loaders'), '["fabric"]');
       return json([{
         id: 'version123', project_id: 'project123', project_type: 'mod',
-        name: 'Example', version_number: '1.0', game_versions: ['1.21.8'], loaders: ['fabric']
+        name: 'Example', version_number: '1.0', game_versions: ['1.21.8'], loaders: ['fabric'],
+        files: [{ filename: 'example.jar', primary: true }]
       }]);
     },
   });
   assert.equal(versions[0].id, 'version123');
   assert.equal(versions[0].projectType, 'mod');
   assert.deepEqual(versions[0].loaders, ['fabric']);
+  assert.deepEqual(versions[0].files, [{ filename: 'example.jar', primary: true }]);
 });

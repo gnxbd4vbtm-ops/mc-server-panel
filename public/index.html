@@ -34,7 +34,7 @@
           <span class="brand-copy"><strong>BYTE</strong><small>SERVER PANEL</small></span>
         </a>
         <div class="sidebar-label">Workspace</div>
-        <nav class="navigation">
+        <nav id="workspace-navigation" class="navigation">
           <a href="#overview" data-page="overview" class="nav-item active" title="Overview"><span class="nav-icon">◫</span>Overview</a>
           <a href="#servers" data-page="servers" class="nav-item" title="Servers"><span class="nav-icon">▤</span>Servers <span id="nav-server-count" class="nav-count">0</span></a>
           <a href="#catalog" data-page="catalog" class="nav-item" title="Software catalog"><span class="nav-icon">◈</span>Software catalog</a>
@@ -51,6 +51,7 @@
             <a href="#" data-server-section="mods" class="nav-item"><span class="nav-icon">◈</span>Mods</a>
             <a href="#" data-server-section="plugins" class="nav-item"><span class="nav-icon">◇</span>Plugins</a>
             <a href="#" data-server-section="worlds" class="nav-item"><span class="nav-icon">▧</span>Worlds</a>
+            <a href="#" data-server-section="players" class="nav-item"><span class="nav-icon">♙</span>Players & settings</a>
             <a href="#" data-server-section="console" class="nav-item"><span class="nav-icon">›_</span>Console</a>
             <a href="#" data-server-section="logs" class="nav-item"><span class="nav-icon">≡</span>Logs</a>
           </nav>
@@ -118,6 +119,7 @@
             <label class="field">Search<input id="modrinth-query" maxlength="200" placeholder="Search Modrinth"></label>
             <button class="button button-primary" type="submit">Search</button>
           </form>
+          <p id="modrinth-compatibility" class="content-compatibility" role="status"></p>
           <div id="modrinth-results" class="version-list"></div>
         </section>
 
@@ -174,7 +176,7 @@
         <div class="form-grid">
           <label class="field field-wide">Server name<input name="name" required minlength="2" maxlength="48" placeholder="e.g. Survival" autocomplete="off"></label>
           <label class="field field-wide">Description <span class="optional">Optional</span><input name="description" maxlength="500" placeholder="A short note about this server"></label>
-          <label class="field">Minecraft version<input name="minecraftVersion" id="create-version" required value="1.21.8" list="minecraft-versions" placeholder="1.21.8"><datalist id="minecraft-versions"></datalist><small id="version-hint">Enter a version identifier; Java requirements are checked against Mojang metadata.</small></label>
+          <label class="field">Minecraft version<select name="minecraftVersion" id="create-version" required disabled><option value="">Loading available versions…</option></select><small id="version-hint">Choose a version available from the official Minecraft catalogue.</small></label>
           <label class="field">Software<select name="software" id="create-software"><option value="vanilla">Vanilla</option><option value="fabric">Fabric</option><option value="forge">Forge</option><option value="neoforge">NeoForge</option><option value="quilt">Quilt</option><option value="paper">Paper</option><option value="purpur">Purpur</option></select><small id="provider-catalog-hint">Loaders and server jars are resolved from their official catalogs.</small></label>
           <label class="field">Maximum heap memory (MB)<input name="memoryMb" type="number" min="512" step="256" value="2048" required><small>Available host memory is checked before saving.</small></label>
           <label class="field">Server port<input name="port" type="number" min="1024" max="65535" value="25565" required></label>
@@ -183,21 +185,11 @@
         </div>
         <div class="review-note"><span>✓</span><div><strong>Review before installing</strong><small>The panel will download one verified server jar from Mojang into a new, isolated instance directory. You must accept the Minecraft EULA before the first start.</small></div></div>
         <div id="create-error" class="form-error hidden" role="alert"></div>
-        <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Create instance</button></div>
+        <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit" disabled>Create instance</button></div>
       </form>
     </dialog>
 
-    <dialog id="admin-dialog" class="dialog dialog-wide">
-      <div class="dialog-content">
-        <div class="dialog-top"><div><div class="eyebrow">SERVER ADMINISTRATION</div><h2 id="admin-title">Manage server</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close">×</button></div>
-        <nav class="manage-tabs" aria-label="Server sections" role="tablist">
-          <button class="manage-tab active" type="button" role="tab" aria-selected="true" aria-controls="manage-files" data-manage-tab="files">Files</button>
-          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-mods" data-manage-tab="mods">Mods</button>
-          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-plugins" data-manage-tab="plugins">Plugins</button>
-          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-worlds" data-manage-tab="worlds">Worlds</button>
-          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-console" data-manage-tab="console">Console</button>
-          <button class="manage-tab" type="button" role="tab" aria-selected="false" aria-controls="manage-logs" data-manage-tab="logs">Logs</button>
-        </nav>
+    <template id="server-management-template">
         <section id="manage-files" class="manage-panel active" role="tabpanel">
           <h3>Server files</h3>
           <div class="file-toolbar"><button id="file-up" class="button button-secondary button-small" type="button">Up</button><span id="file-path-label">/</span><button id="file-reload" class="button button-secondary button-small" type="button">Refresh</button></div><div id="file-list" class="file-list"></div>
@@ -221,7 +213,10 @@
         <section id="manage-worlds" class="manage-panel" role="tabpanel" hidden>
           <div class="manage-section-heading"><div><h3>Worlds</h3><p>World folders are detected from server data. Save and stop the server before changing world files.</p></div><button id="worlds-refresh" class="button button-secondary button-small" type="button">Refresh</button></div>
           <div id="world-list" class="server-list"></div>
-          <div class="world-admin-section"><h3>Players, world settings & datapacks</h3><form id="admin-command-form" class="admin-command-form">
+        </section>
+        <section id="manage-players" class="manage-panel" role="tabpanel" hidden>
+          <div class="manage-section-heading"><div><h3>Players, world settings & datapacks</h3><p>Manage player access and common world settings using validated server commands.</p></div></div>
+          <div class="world-admin-section"><form id="admin-command-form" class="admin-command-form">
             <label class="field">Action<select name="action"><option value="ban">Ban player</option><option value="pardon">Pardon player</option><option value="ban-ip">Ban IP/player</option><option value="whitelist.add">Whitelist add</option><option value="whitelist.remove">Whitelist remove</option><option value="whitelist.list">Whitelist list</option><option value="whitelist.on">Whitelist on</option><option value="whitelist.off">Whitelist off</option><option value="op">Grant operator</option><option value="deop">Remove operator</option><option value="list">List players</option><option value="save-all">Save world</option><option value="difficulty">Set difficulty</option><option value="time">Set/add time</option><option value="weather">Set weather</option><option value="datapack.list">List datapacks</option><option value="datapack.enable">Enable datapack</option><option value="datapack.disable">Disable datapack</option></select></label>
             <label class="field">Player / target<input name="player" maxlength="40" autocomplete="off"></label>
             <label class="field">Reason <span class="optional">Optional</span><input name="reason" maxlength="256"></label>
@@ -234,15 +229,15 @@
         </section>
         <section id="manage-console" class="manage-panel" role="tabpanel" hidden>
           <h3>Server console</h3><div class="console-status" id="console-status"></div>
+          <div id="console-output" class="console-output" aria-live="polite"></div>
           <form id="console-form" class="console-form"><label class="sr-only" for="console-command">Console command</label><span class="console-prompt">›</span><input id="console-command" autocomplete="off" placeholder="Type a server command…" maxlength="256"><button class="button button-primary button-small" type="submit">Send</button></form>
-          <p class="console-warning">Console access grants server administrator privileges. Commands are sent to the running server process. Output is available in Logs.</p>
+          <p class="console-warning">Console access grants server administrator privileges. Commands are sent to the running server process; live output is shown above and is also available in Logs.</p>
         </section>
         <section id="manage-logs" class="manage-panel" role="tabpanel" hidden>
           <div class="manage-section-heading"><div><h3>Server logs</h3><p>Recent process output and server log entries.</p></div><button id="logs-refresh" class="button button-secondary button-small" type="button">Refresh</button></div>
-          <div id="console-output" class="console-output" aria-live="polite"></div>
+          <div id="server-log-output" class="console-output" aria-live="polite"></div>
         </section>
-      </div>
-    </dialog>
+    </template>
 
     <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   </body>

@@ -466,12 +466,12 @@ export class ServerManager {
         await rm(installerPath, { force: true });
       }
       checkCancelled(options.signal);
-      installedPaths.push(...await mergeDirectory(stage, server.directory));
       if (['fabric', 'quilt'].includes(server.software)) {
         const launcher = server.software === 'fabric' ? 'fabric-server-launch.jar' : 'quilt-server-launch.jar';
-        await rename(path.join(server.directory, launcher), path.join(server.directory, 'server.jar'));
-        installedPaths.push(path.join(server.directory, 'server.jar'));
+        await assertInstalledJar(path.join(stage, 'server.jar'), `${server.software} Minecraft server`);
+        await assertInstalledJar(path.join(stage, launcher), `${server.software} launcher`);
       }
+      installedPaths.push(...await mergeDirectory(stage, server.directory));
       if (['forge', 'neoforge'].includes(server.software)) {
         const argsPath = server.software === 'forge'
           ? path.join(server.directory, 'libraries', 'net', 'minecraftforge', 'forge', softwareVersion, 'unix_args.txt')
@@ -873,12 +873,90 @@ export class ServerManager {
     const inspectedJava = await this.inspectJava(server.javaPath);
     const requiredMajor = server.requiredJavaMajor ?? requiredJavaMajor(server.minecraftVersion);
     this.assertJavaCompatibility(inspectedJava, requiredMajor);
+    await this.repairLegacyLoaderInstallation(server);
     server.rconPassword = await this.ensureRconConfiguration(server);
     if (!server.eulaAccepted && input.acceptEula === true) {
       return this.acceptEulaAndStart(server);
     }
     if (!server.eulaAccepted) throw clientError('You must accept the Minecraft EULA before starting this server.', 403);
     return this.spawnServer(server);
+  }
+
+  async repairLegacyLoaderInstallation(server) {
+    if (!['fabric', 'quilt'].includes(server.software)) return;
+    const launcherName = server.software === 'fabric' ? 'fabric-server-launch.jar' : 'quilt-server-launch.jar';
+    const launcherPath = path.join(server.directory, launcherName);
+    try {
+      const launcherInfo = await lstat(launcherPath);
+      if (launcherInfo.isFile() && !launcherInfo.isSymbolicLink() && launcherInfo.size > 0) return;
+      throw clientError(`${server.software} launcher is not a regular, non-empty file.`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+
+    const gameJarPath = path.join(server.directory, 'server.jar');
+    const oldJarInfo = await lstat(gameJarPath);
+    if (!oldJarInfo.isFile() || oldJarInfo.isSymbolicLink() || oldJarInfo.size < 4 || oldJarInfo.size > 128 * 1024 ** 2) {
+      throw clientError(`The ${server.software} installation is incomplete and cannot be repaired automatically.`);
+    }
+    const oldLauncher = await readFile(gameJarPath);
+    if (oldLauncher.subarray(0, 4).toString('binary') !== 'PK\u0003\u0004') {
+      throw clientError(`The ${server.software} server JAR is not a valid loader archive; reinstall the server software.`);
+    }
+
+    const signal = AbortSignal.timeout(120000);
+    const manifestResponse = await this.fetchMojang(VERSION_MANIFEST_URL, { signal });
+    if (!manifestResponse.ok) throw clientError(`Minecraft version catalogue returned HTTP ${manifestResponse.status}.`, 502);
+    const manifest = await manifestResponse.json();
+    const version = manifest.versions?.find((entry) => entry.id === server.minecraftVersion);
+    if (!version) throw clientError(`Minecraft ${server.minecraftVersion} is not in the official version catalogue.`, 404);
+    const metadataResponse = await this.fetchMojang(checkedMojangUrl(version.url), { signal });
+    if (!metadataResponse.ok) throw clientError(`Version metadata returned HTTP ${metadataResponse.status}.`, 502);
+    const download = (await metadataResponse.json()).downloads?.server;
+    if (!download?.url || !Number.isSafeInteger(download.size) || download.size < 1 || download.size > 2 * 1024 ** 3
+        || typeof download.sha1 !== 'string' || !/^[a-f0-9]{40}$/i.test(download.sha1)) {
+      throw clientError(`Minecraft ${server.minecraftVersion} does not publish a verifiable server JAR.`, 422);
+    }
+    const filesystem = await statfs(server.directory);
+    if (filesystem.bavail * filesystem.bsize < download.size + oldJarInfo.size) {
+      throw clientError('There is not enough free disk space to repair this loader installation.', 507);
+    }
+
+    const stage = path.join(server.directory, `.loader-repair-${randomUUID()}`);
+    await mkdir(stage, { recursive: false, mode: 0o700 });
+    const stagedLauncher = path.join(stage, launcherName);
+    const stagedGameJar = path.join(stage, 'server.jar');
+    const previousGameJar = path.join(stage, 'previous-server.jar');
+    try {
+      await writeFile(stagedLauncher, oldLauncher, { flag: 'wx', mode: 0o600 });
+      const response = await this.fetchMojang(checkedMojangUrl(download.url), { signal });
+      if (!response.ok || !response.body) throw clientError(`Minecraft server download returned HTTP ${response.status}.`, 502);
+      const hash = createHash('sha1');
+      let bytes = 0;
+      await pipeline(response.body, async function* (source) {
+        for await (const chunk of source) {
+          bytes += chunk.length;
+          if (bytes > download.size) throw clientError('Minecraft server download exceeded its published size.', 502);
+          hash.update(chunk);
+          yield chunk;
+        }
+      }, createWriteStream(stagedGameJar, { flags: 'wx', mode: 0o600 }), { signal });
+      if (bytes !== download.size || hash.digest('hex') !== download.sha1.toLowerCase()) {
+        throw clientError('Minecraft server JAR failed official size or SHA-1 verification.', 502);
+      }
+      await rename(gameJarPath, previousGameJar);
+      try {
+        await rename(stagedLauncher, launcherPath);
+        await rename(stagedGameJar, gameJarPath);
+      } catch (error) {
+        await rm(launcherPath, { force: true });
+        await rename(previousGameJar, gameJarPath);
+        throw error;
+      }
+      this.db.addEvent(server.id, 'success', `Repaired the previous ${server.software} launcher and restored the Minecraft server JAR.`);
+    } finally {
+      await rm(stage, { recursive: true, force: true });
+    }
   }
 
   async acceptEulaAndStart(server) {
@@ -889,7 +967,9 @@ export class ServerManager {
   }
 
   spawnServer(server) {
-    const jarPath = path.join(server.directory, 'server.jar');
+    const launcherJar = server.software === 'fabric' ? 'fabric-server-launch.jar'
+      : server.software === 'quilt' ? 'quilt-server-launch.jar' : 'server.jar';
+    const jarPath = path.join(server.directory, launcherJar);
     const memoryArgs = [`-Xms${Math.min(server.memoryMb, 1024)}M`, `-Xmx${server.memoryMb}M`];
     const launchArgs = ['forge', 'neoforge'].includes(server.software)
       ? [
@@ -1371,7 +1451,11 @@ export class ServerManager {
 
   async fetchMojang(url, options) {
     try {
-      return await this.fetch(url, { ...options, redirect: 'error' });
+      return await this.fetch(url, {
+        ...options,
+        redirect: 'error',
+        headers: { ...options.headers, 'accept-encoding': 'identity' },
+      });
     } catch (error) {
       if (options.signal?.aborted) throw error;
       if (Number.isInteger(error?.status)) throw error;
@@ -1893,11 +1977,23 @@ function isPortAvailable(port) {
   });
 }
 
+async function assertInstalledJar(filename, label) {
+  const info = await lstat(filename);
+  if (!info.isFile() || info.isSymbolicLink() || info.size === 0) {
+    throw clientError(`${label} installer did not produce a valid JAR.`);
+  }
+}
+
 async function isManagedProcess(pid, server) {
   if (!Number.isInteger(pid) || pid < 2 || process.platform !== 'linux') return false;
   try {
     const commandLine = await readFile(`/proc/${pid}/cmdline`, 'utf8');
-    if (commandLine.includes(`\0-jar\0${path.join(server.directory, 'server.jar')}\0`)) return true;
+    const launcherJar = server.software === 'fabric' ? 'fabric-server-launch.jar'
+      : server.software === 'quilt' ? 'quilt-server-launch.jar' : 'server.jar';
+    const launchedByJar = [launcherJar, 'server.jar'].some((jarName) =>
+      commandLine.includes(`\0-jar\0${path.join(server.directory, jarName)}\0`)
+    );
+    if (launchedByJar) return true;
     if (!['forge', 'neoforge'].includes(server.software) || !server.softwareVersion) return false;
     const argumentFile = server.software === 'forge'
       ? path.join(server.directory, 'libraries', 'net', 'minecraftforge', 'forge', server.softwareVersion, 'unix_args.txt')

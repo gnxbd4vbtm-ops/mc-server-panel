@@ -201,7 +201,10 @@ async function requestBytes(url, {
         method: 'GET',
         redirect: 'manual',
         signal: controller.signal,
-        headers: { accept: 'application/json, application/xml, text/plain, application/octet-stream' },
+        headers: {
+          accept: 'application/json, application/xml, text/plain, application/octet-stream',
+          'accept-encoding': 'identity',
+        },
       });
       if (![301, 302, 303, 307, 308].includes(response?.status)) break;
       const location = response.headers?.get?.('location');
@@ -643,10 +646,15 @@ export async function listModrinthVersions(projectId, {
     if (modrinthId(entry?.project_id, 'project ID') !== id
         || (entry.project_type !== undefined && !MODRINTH_TYPES.has(entry.project_type))
         || (type !== undefined && entry.project_type !== undefined && entry.project_type !== type)
-        || !Array.isArray(entry.game_versions) || !Array.isArray(entry.loaders)) {
+        || !Array.isArray(entry.game_versions) || !Array.isArray(entry.loaders)
+        || !Array.isArray(entry.files) || entry.files.length === 0) {
       fail('Modrinth returned an invalid project version.', 'INVALID_METADATA');
     }
     const versionId = modrinthId(entry.id, 'version ID');
+    const files = entry.files.map((file) => {
+      if (!safeFilename(file?.filename)) fail('Modrinth returned an invalid filename.', 'INVALID_METADATA');
+      return { filename: file.filename, primary: file.primary === true };
+    });
     return {
       id: versionId,
       projectId: id,
@@ -655,6 +663,7 @@ export async function listModrinthVersions(projectId, {
       versionNumber: boundedText(entry.version_number, 100),
       gameVersions: entry.game_versions.slice(0, 500).map((version) => validToken(version, 'game version', 64)),
       loaders: entry.loaders.slice(0, 100).map((loaderId) => validToken(loaderId, 'loader')),
+      files,
     };
   });
 }

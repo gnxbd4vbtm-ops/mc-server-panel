@@ -8,23 +8,98 @@ const state = {
   schedules: [],
   metrics: {},
   currentPage: 'overview',
+  serverPageId: null,
+  hasLoadedServers: false,
   consoleServerId: null,
   consoleLogInterval: null,
   refreshInterval: null,
   authMode: 'login',
   adminServerId: null,
-  manageTab: 'files',
+  manageTab: 'overview',
   fileDirectory: '',
   selectedFile: ''
 };
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
+const MODDED_SOFTWARE = new Set(['fabric', 'forge', 'neoforge', 'quilt']);
+const PLUGIN_SOFTWARE = new Set(['paper', 'purpur']);
+const managementTemplate = $('#server-management-template');
+$('#server-page-sections').append(
+  ...[...managementTemplate.content.querySelectorAll('.manage-panel')].map((panel) => panel.cloneNode(true))
+);
+managementTemplate.remove();
 
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
 })[character]);
 const trashIcon = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h13M8 5.5V3.7h4v1.8m-6.5 0 .8 11h7.4l.8-11M8.3 8.2v5.5m3.4-5.5v5.5"/></svg>';
+
+function supportsContent(server, type) {
+  if (type === 'mod') return MODDED_SOFTWARE.has(server?.software);
+  if (type === 'plugin') return PLUGIN_SOFTWARE.has(server?.software);
+  return type === 'modpack' && MODDED_SOFTWARE.has(server?.software);
+}
+
+function contentCompatibilityMessage(server, type) {
+  if (!server) return 'Install a server before searching for content.';
+  if (type === 'modpack') {
+    return 'Modpacks must include files compatible with this server software and Minecraft version.';
+  }
+  if (type === 'mod' && supportsContent(server, type)) {
+    return `${server.software} mods for Minecraft ${server.minecraftVersion} are available to browse.`;
+  }
+  if (type === 'plugin' && supportsContent(server, type)) {
+    return `${server.software} plugins for Minecraft ${server.minecraftVersion} are available to browse.`;
+  }
+  if (type === 'mod') {
+    return `${server.software} does not load mods. Mods require Fabric, Forge, NeoForge, or Quilt.`;
+  }
+  if (type === 'plugin') {
+    return `${server.software} does not load plugins. Plugins require Paper or Purpur.`;
+  }
+  const supportsMods = supportsContent(server, 'mod');
+  const supportsPlugins = supportsContent(server, 'plugin');
+  if (supportsMods) return `${server.software} supports mods, not Paper/Purpur plugins.`;
+  if (supportsPlugins) return `${server.software} supports plugins, not Fabric/Forge/NeoForge/Quilt mods.`;
+  return `${server.software} does not load mods or plugins.`;
+}
+
+function updateModrinthCompatibility() {
+  const server = state.servers.find((item) => item.id === $('#modrinth-server').value);
+  const typeSelect = $('#modrinth-type');
+  for (const option of typeSelect.options) {
+    option.hidden = !supportsContent(server, option.value);
+  }
+  if (typeSelect.selectedOptions[0]?.hidden) {
+    typeSelect.value = ['mod', 'plugin', 'modpack'].find((type) => supportsContent(server, type)) ?? '';
+  }
+  $('#modrinth-compatibility').textContent = server
+    ? typeSelect.value
+      ? contentCompatibilityMessage(server, typeSelect.value)
+      : `${server.software} has no supported Modrinth content types.`
+    : 'Install a server before searching for content.';
+  $('#modrinth-search-form button[type="submit"]').disabled = !server || !typeSelect.value;
+}
+
+function handleModrinthSelectionChange() {
+  updateModrinthCompatibility();
+  $('#modrinth-results').replaceChildren();
+}
+
+function updateManagedContentCompatibility() {
+  const server = state.servers.find((item) => item.id === state.adminServerId);
+  for (const form of $$('.manage-search-form')) {
+    const type = form.dataset.manageSearch;
+    const supported = supportsContent(server, type);
+    form.closest('.manage-panel').hidden = !supported;
+    $(`[data-server-section="${type === 'mod' ? 'mods' : 'plugins'}"]`).hidden = !supported;
+    if (!supported) {
+      const targetId = type === 'mod' ? 'manage-mod-results' : 'manage-plugin-results';
+      $(`#${targetId}`).replaceChildren();
+    }
+  }
+}
 
 async function api(url, options = {}) {
   const response = await fetch(url, {
@@ -43,6 +118,7 @@ async function boot() {
     if (status.authenticated) {
       $('#app-shell').hidden = false;
       await refresh();
+      void loadVersions();
       state.refreshInterval = setInterval(() => void refresh(), 5000);
       return;
     }
@@ -144,10 +220,12 @@ function eventMarkup(event) {
 
 async function refresh() {
   try {
+    const previousTasks = new Map(state.tasks.map((task) => [task.id, task.status]));
     const [servers, events, backups, tasks, schedules] = await Promise.all([
       api('/api/servers'), api('/api/events'), api('/api/backups'), api('/api/tasks'), api('/api/schedules')
     ]);
     state.servers = servers;
+    state.hasLoadedServers = true;
     state.events = events;
     state.backups = backups;
     state.tasks = tasks;
@@ -159,9 +237,41 @@ async function refresh() {
     state.metrics = Object.fromEntries(metricEntries);
     $('#load-error').classList.add('hidden');
     render();
+    updateManagedInstallButtons(tasks);
+    const contentInstallFinished = tasks.some((task) =>
+      ['content-install', 'modpack-install'].includes(task.type)
+      && task.serverId === state.adminServerId
+      && ['completed', 'failed', 'cancelled'].includes(task.status)
+      && ['queued', 'running', 'cancelling'].includes(previousTasks.get(task.id))
+    );
+    if (contentInstallFinished && state.currentPage === 'server'
+        && ['mods', 'plugins'].includes(state.manageTab)) {
+      const type = state.manageTab === 'mods' ? 'mod' : 'plugin';
+      await loadManagedContent(type === 'mod' ? 'mods' : 'plugins', type === 'mod' ? 'manage-mod-files' : 'manage-plugin-files');
+    }
   } catch (error) {
     $('#load-error').textContent = `Unable to load panel data: ${error.message}`;
     $('#load-error').classList.remove('hidden');
+  }
+}
+
+function updateManagedInstallButtons(tasks) {
+  for (const button of $$('[data-manage-modrinth-install][data-install-task]')) {
+    const task = tasks.find((item) => item.id === button.dataset.installTask);
+    if (!task) continue;
+    if (task.status === 'completed') {
+      button.dataset.uninstallContent = button.dataset.installPath;
+      button.textContent = 'Uninstall';
+      delete button.dataset.installTask;
+      delete button.dataset.installPath;
+      const server = state.servers.find((item) => item.id === state.adminServerId);
+      button.disabled = !server || !['stopped', 'crashed'].includes(server.status);
+    } else if (['failed', 'cancelled'].includes(task.status)) {
+      button.textContent = 'Install latest compatible';
+      delete button.dataset.installTask;
+      delete button.dataset.installPath;
+      button.disabled = false;
+    }
   }
 }
 
@@ -202,6 +312,7 @@ function render() {
   if (contentServers.some((server) => server.id === previousContentServer)) {
     $('#modrinth-server').value = previousContentServer;
   }
+  updateModrinthCompatibility();
   $('#schedule-list').innerHTML = state.schedules.length ? state.schedules.map((schedule) => {
     const server = state.servers.find((item) => item.id === schedule.serverId);
     return `<article class="backup-row"><div class="backup-meta"><strong>${escapeHtml(server?.name ?? 'Deleted server')} · ${escapeHtml(schedule.action)}</strong><small>Every ${escapeHtml(schedule.intervalMinutes)} minutes · Next ${escapeHtml(new Date(schedule.nextRunAt).toLocaleString())}${schedule.lastRunAt ? ` · Last ${escapeHtml(new Date(schedule.lastRunAt).toLocaleString())}` : ''}</small></div><button class="button button-danger button-small" data-action="delete-schedule" data-id="${escapeHtml(schedule.id)}">Delete</button></article>`;
@@ -211,6 +322,7 @@ function render() {
   ));
   $('#metrics-list').innerHTML = metricRows.length ? metricRows.slice(0, 36).join('') : emptyState('No metrics yet', 'Resource samples will appear after the first collection.');
   $('#scheduler-metrics-list').innerHTML = metricRows.length ? metricRows.join('') : emptyState('No metrics available', 'Metrics are sampled once per minute while the panel is running.');
+  showPage(location.hash.slice(1) || 'overview');
 }
 
 function renderServerList() {
@@ -243,12 +355,19 @@ async function searchModrinth() {
     return;
   }
   const type = $('#modrinth-type').value;
+  if (!supportsContent(server, type)) {
+    results.innerHTML = emptyState('Unavailable for this server', contentCompatibilityMessage(server, type));
+    return;
+  }
   const params = new URLSearchParams({
     query: $('#modrinth-query').value.trim(),
     type,
     gameVersion: server.minecraftVersion
   });
   if (type === 'mod' && ['fabric', 'forge', 'neoforge', 'quilt'].includes(server.software)) {
+    params.set('loader', server.software);
+  }
+  if (type === 'plugin' && PLUGIN_SOFTWARE.has(server.software)) {
     params.set('loader', server.software);
   }
   results.innerHTML = '<div class="empty-state"><strong>Searching Modrinth…</strong></div>';
@@ -276,8 +395,15 @@ async function installLatestModrinth(button) {
 async function installModrinthProject(button, server) {
   if (!server) return;
   const type = button.dataset.type;
+  if (!supportsContent(server, type)) {
+    toast(contentCompatibilityMessage(server, type), 'error');
+    return;
+  }
   const params = new URLSearchParams({ type, gameVersion: server.minecraftVersion });
   if (['mod', 'modpack'].includes(type) && ['fabric', 'forge', 'neoforge', 'quilt'].includes(server.software)) {
+    params.set('loader', server.software);
+  }
+  if (type === 'plugin' && PLUGIN_SOFTWARE.has(server.software)) {
     params.set('loader', server.software);
   }
   button.disabled = true;
@@ -285,17 +411,34 @@ async function installModrinthProject(button, server) {
     const versions = await api(`/api/modrinth/projects/${encodeURIComponent(button.dataset.project)}/versions?${params}`);
     const compatible = versions.find((version) => version.gameVersions.includes(server.minecraftVersion));
     if (!compatible) throw new Error('No compatible Modrinth version was found for this server.');
+    const folder = type === 'plugin' ? 'plugins' : 'mods';
+    const file = compatible.files.find((candidate) => candidate.primary) ?? compatible.files[0];
+    const contentPath = ['mod', 'plugin'].includes(type) && file ? `${folder}/${file.filename}` : '';
+    if (button.matches('[data-manage-modrinth-install]') && contentPath) {
+      const installed = await api(`/api/servers/${server.id}/files?path=${encodeURIComponent(folder)}`);
+      if (installed.some((entry) => entry.type === 'file' && entry.name === file.filename)) {
+        button.dataset.uninstallContent = contentPath;
+        button.textContent = 'Uninstall';
+        button.disabled = !['stopped', 'crashed'].includes(server.status);
+        return;
+      }
+    }
     if (!confirm(`Install ${type} ${compatible.name || compatible.versionNumber} on ${server.name}? The content will be hash-verified and written only inside this server directory.`)) return;
     const task = await api(`/api/servers/${server.id}/content`, {
       method: 'POST',
       body: JSON.stringify({ contentType: type, versionId: compatible.id, confirmed: true })
     });
+    if (button.matches('[data-manage-modrinth-install]') && contentPath) {
+      button.dataset.installTask = task.id;
+      button.dataset.installPath = contentPath;
+      button.textContent = 'Installing…';
+    }
     toast(`${type} installation queued (${task.id.slice(0, 8)}).`);
     await refresh();
   } catch (error) {
     toast(error.message, 'error');
   } finally {
-    button.disabled = false;
+    if (!button.dataset.installTask) button.disabled = false;
   }
 }
 
@@ -305,15 +448,121 @@ function backupMarkup(backup) {
   return `<article class="backup-row"><div class="backup-meta"><strong>${escapeHtml(server?.name ?? backup.server_id ?? 'Deleted server')}</strong><small>${escapeHtml(new Date(backup.created_at).toLocaleString())} · ${escapeHtml(bytes(backup.size_bytes))} · ${backup.archive ? `Compressed archive · SHA-256 ${escapeHtml(backup.integrity)}` : 'Legacy directory snapshot'}</small></div><span class="tag">${label}</span>${backup.available && backup.archive ? `<button class="button button-secondary button-small" data-action="download-backup" data-id="${escapeHtml(backup.id)}">Download</button>` : ''}${server && backup.available ? `<button class="button button-secondary button-small" data-action="restore" data-id="${escapeHtml(server.id)}" data-backup="${escapeHtml(backup.id)}">Restore</button>` : ''}<button class="button button-danger button-small" data-action="delete-backup" data-id="${escapeHtml(backup.id)}">Delete</button></article>`;
 }
 
-function showPage(page) {
+function showPage(route) {
+  const [page, serverId, requestedSection] = route.split('/');
+  const serverRoute = page === 'server' && serverId;
   const knownPages = new Set(['overview', 'servers', 'catalog', 'backups', 'scheduler', 'activity']);
-  if (!knownPages.has(page)) page = 'overview';
+  if (!serverRoute && !knownPages.has(page)) route = 'overview';
+
+  if (serverRoute) {
+    let section = ['overview', 'files', 'mods', 'plugins', 'worlds', 'players', 'console', 'logs'].includes(requestedSection)
+      ? requestedSection
+      : 'overview';
+    const server = state.servers.find((item) => item.id === serverId);
+    if (!server && state.hasLoadedServers) {
+      location.hash = 'servers';
+      return;
+    }
+    if (server && ((section === 'mods' && !supportsContent(server, 'mod'))
+        || (section === 'plugins' && !supportsContent(server, 'plugin')))) {
+      section = 'overview';
+      location.hash = `server/${encodeURIComponent(serverId)}/overview`;
+    }
+    const serverChanged = state.serverPageId !== serverId;
+    state.currentPage = 'server';
+    state.serverPageId = serverId;
+    state.adminServerId = serverId;
+    state.consoleServerId = serverId;
+    $('#workspace-navigation').hidden = true;
+    $('#server-navigation').classList.remove('hidden');
+    $('#server-navigation-name').textContent = server?.name ?? 'Loading server…';
+    $('#admin-title').textContent = server ? `${server.name} · ${section[0].toUpperCase()}${section.slice(1)}` : 'Loading server…';
+    $('#server-page-description').textContent = server
+      ? `${server.software} · Minecraft ${server.minecraftVersion} · Port ${server.port}`
+      : 'Loading server details…';
+    $('#server-page-status').textContent = server ? statusLabel(server) : 'Loading';
+    $('#server-page-status').className = `status-pill ${server?.installed ? server.status : 'not-installed'}`;
+    $('#console-status').textContent = server && ['running', 'orphaned'].includes(server.status)
+      ? 'Connected to the server process.'
+      : 'The server is stopped. Start it to send commands; existing logs remain available.';
+    const actionButton = $('#server-page-action');
+    actionButton.dataset.action = !server?.installed
+      ? 'install'
+      : server.status === 'running' || server.status === 'starting' || server.status === 'orphaned'
+        ? 'stop'
+        : server.status === 'unknown' ? 'confirm-stopped' : 'start';
+    actionButton.dataset.id = serverId;
+    actionButton.textContent = !server?.installed
+      ? 'Install server'
+      : server.status === 'running' || server.status === 'starting' || server.status === 'orphaned'
+        ? 'Stop server'
+        : server.status === 'unknown' ? 'Confirm stopped' : 'Start server';
+    actionButton.disabled = !server;
+    $('#server-page-backup').dataset.action = 'backup';
+    $('#server-page-backup').dataset.id = serverId;
+    $('#server-page-backup').hidden = !server?.installed || !['stopped', 'crashed'].includes(server.status);
+    $('#server-detail-version').textContent = server?.minecraftVersion ?? '—';
+    $('#server-detail-software').textContent = server?.software ?? '—';
+    $('#server-detail-players').textContent = server?.players == null ? '—' : server.players;
+    $('#server-detail-uptime').textContent = server?.status === 'running' ? elapsed(server.uptimeSeconds) : '—';
+    $('#server-detail-disk').textContent = server ? bytes(server.diskBytes) : '—';
+    $('#server-detail-port').textContent = server?.port ?? '—';
+    $('#server-detail-memory').textContent = server ? `${server.memoryMb} MB` : '—';
+    $('#server-detail-events').innerHTML = state.events
+      .filter((event) => event.server_id === serverId || event.serverId === serverId)
+      .slice(0, 8)
+      .map(eventMarkup)
+      .join('') || emptyState('No server activity yet', 'Events for this server will appear here.');
+    for (const link of $$('[data-server-section]')) {
+      const active = link.dataset.serverSection === section;
+      link.href = `#server/${encodeURIComponent(serverId)}/${link.dataset.serverSection}`;
+      if (link.dataset.serverSection === 'mods') link.hidden = !supportsContent(server, 'mod');
+      if (link.dataset.serverSection === 'plugins') link.hidden = !supportsContent(server, 'plugin');
+      link.classList.toggle('active', active);
+    }
+    $('#breadcrumb-current').textContent = `${server?.name ?? 'Server'} · ${section[0].toUpperCase()}${section.slice(1)}`;
+    if (server && (serverChanged || state.manageTab !== section)) {
+      void activateManageTab(section);
+    } else if (!server) {
+      state.manageTab = '';
+      for (const panel of $$('.manage-panel')) {
+        const active = panel.id === (section === 'overview' ? 'server-page-overview' : `manage-${section}`);
+        panel.classList.toggle('active', active);
+        panel.hidden = !active;
+      }
+    }
+    if (server && (section === 'console' || section === 'logs')) {
+      if (!state.consoleLogInterval) state.consoleLogInterval = setInterval(() => void refreshConsole(), 2000);
+    } else {
+      clearInterval(state.consoleLogInterval);
+      state.consoleLogInterval = null;
+    }
+    for (const item of $$('.page')) item.classList.toggle('active', item.id === 'page-server');
+    return;
+  }
+
   state.currentPage = page;
+  state.serverPageId = null;
+  state.adminServerId = null;
+  state.consoleServerId = null;
+  clearInterval(state.consoleLogInterval);
+  state.consoleLogInterval = null;
+  $('#workspace-navigation').hidden = false;
+  $('#server-navigation').classList.add('hidden');
   for (const item of $$('.page')) item.classList.toggle('active', item.id === `page-${page}`);
-  for (const item of $$('.nav-item')) item.classList.toggle('active', item.dataset.page === page);
-  const title = $(`.nav-item[data-page="${page}"]`)?.title ?? 'Overview';
-  $('#breadcrumb-current').textContent = title;
+  for (const item of $$('.nav-item[data-page]')) item.classList.toggle('active', item.dataset.page === page);
+  $('#breadcrumb-current').textContent = $(`.nav-item[data-page="${page}"]`)?.title ?? 'Overview';
   if (page === 'catalog' && state.versions.length === 0) void loadVersions();
+}
+
+function navigateToServerSection(section) {
+  if (!state.serverPageId) return;
+  const route = `server/${encodeURIComponent(state.serverPageId)}/${section}`;
+  if (location.hash.slice(1) === route) {
+    void activateManageTab(section);
+  } else {
+    location.hash = route;
+  }
 }
 
 async function loadJavaRuntimes() {
@@ -386,7 +635,10 @@ async function loadVersions() {
     state.versions = await api('/api/versions');
     renderVersions();
   } catch (error) {
-    list.innerHTML = `<div class="notice notice-error">Could not load versions: ${escapeHtml(error.message)}. You can still create an instance by entering a version identifier.</div>`;
+    list.innerHTML = `<div class="notice notice-error">Could not load versions: ${escapeHtml(error.message)}. Refresh the catalogue to select an available server version.</div>`;
+    $('#create-version').innerHTML = `<option value="">Could not load versions: ${escapeHtml(error.message)}</option>`;
+    $('#create-version').disabled = true;
+    $('#create-form button[type="submit"]').disabled = true;
   }
 }
 
@@ -397,7 +649,18 @@ function renderVersions() {
   $('#version-list').innerHTML = filtered.map((version) => `
     <div class="version-row"><div class="version-meta"><strong>${escapeHtml(version.id)}</strong><small>Released ${escapeHtml(new Date(version.releaseTime).toLocaleDateString())}</small></div><span class="tag">${escapeHtml(version.type)}</span><button class="button button-secondary button-small" data-select-version="${escapeHtml(version.id)}">Use version</button></div>`).join('')
     || emptyState('No matching versions', 'Try a different version number or search.');
-  $('#minecraft-versions').innerHTML = state.versions.map((version) => `<option value="${escapeHtml(version.id)}"></option>`).join('');
+  const versionSelect = $('#create-version');
+  const previousVersion = versionSelect.value;
+  versionSelect.innerHTML = state.versions.map((version) =>
+    `<option value="${escapeHtml(version.id)}">${escapeHtml(version.id)} · ${escapeHtml(version.type)}</option>`
+  ).join('');
+  versionSelect.value = state.versions.some((version) => version.id === previousVersion)
+    ? previousVersion
+    : (state.versions.find((version) => version.id === '1.21.8')
+      ?? state.versions.find((version) => version.type === 'release')
+      ?? state.versions[0]).id;
+  versionSelect.disabled = false;
+  $('#create-form button[type="submit"]').disabled = false;
 }
 
 async function createServer(form) {
@@ -515,13 +778,14 @@ async function openConsole(server) {
   await openAdmin(server, 'console');
 }
 
-async function openAdmin(server, tab = 'files') {
+async function openAdmin(server, tab = 'overview') {
   clearInterval(state.consoleLogInterval);
+  state.consoleLogInterval = null;
   state.adminServerId = server.id;
   state.consoleServerId = server.id;
   state.fileDirectory = '';
   state.selectedFile = '';
-  $('#admin-title').textContent = `${server.name} · Manage`;
+  state.manageTab = '';
   $('#file-editor').value = '';
   $('#file-editor').disabled = true;
   $('#file-save').disabled = true;
@@ -530,24 +794,19 @@ async function openAdmin(server, tab = 'files') {
   $('#console-status').textContent = ['running', 'orphaned'].includes(server.status)
     ? 'Connected to the server process.'
     : 'The server is stopped. Start it to send commands; existing logs remain available.';
-  await activateManageTab(tab);
-  $('#admin-dialog').showModal();
-  state.consoleLogInterval = setInterval(() => void refreshConsole(), 2000);
-  await refreshConsole();
+  location.hash = `server/${encodeURIComponent(server.id)}/${tab}`;
 }
 
 async function activateManageTab(tab) {
-  const allowed = new Set(['files', 'mods', 'plugins', 'worlds', 'console', 'logs']);
+  const allowed = new Set(['overview', 'files', 'mods', 'plugins', 'worlds', 'players', 'console', 'logs']);
   if (!allowed.has(tab)) tab = 'files';
   state.manageTab = tab;
-  for (const button of $$('.manage-tab')) {
-    const active = button.dataset.manageTab === tab;
-    button.classList.toggle('active', active);
-    button.setAttribute('aria-selected', String(active));
-    button.tabIndex = active ? 0 : -1;
+  updateManagedContentCompatibility();
+  for (const link of $$('[data-server-section]')) {
+    link.classList.toggle('active', link.dataset.serverSection === tab);
   }
   for (const panel of $$('.manage-panel')) {
-    const active = panel.id === `manage-${tab}`;
+    const active = panel.id === (tab === 'overview' ? 'server-page-overview' : `manage-${tab}`);
     panel.classList.toggle('active', active);
     panel.hidden = !active;
   }
@@ -555,7 +814,7 @@ async function activateManageTab(tab) {
   if (tab === 'mods') await loadManagedContent('mods', 'manage-mod-files');
   if (tab === 'plugins') await loadManagedContent('plugins', 'manage-plugin-files');
   if (tab === 'worlds') await loadWorldList();
-  if (tab === 'logs') await refreshConsole();
+  if (tab === 'console' || tab === 'logs') await refreshConsole();
 }
 
 async function loadFileList() {
@@ -579,8 +838,16 @@ async function loadManagedContent(directory, targetId) {
   target.innerHTML = '<small>Loading…</small>';
   try {
     const files = await api(`/api/servers/${state.adminServerId}/files?path=${encodeURIComponent(directory)}`);
+    const server = state.servers.find((item) => item.id === state.adminServerId);
+    const canUninstall = server && ['stopped', 'crashed'].includes(server.status);
     target.innerHTML = files.length
-      ? files.map((entry) => `<div class="file-entry file-entry-static"><span>${entry.type === 'directory' ? '▸' : '▤'}</span><span>${escapeHtml(entry.name)}</span><small>${entry.type === 'file' ? escapeHtml(bytes(entry.size)) : escapeHtml(entry.type)}</small></div>`).join('')
+      ? files.map((entry) => {
+        const contentPath = `${directory}/${entry.name}`;
+        const action = entry.type === 'file' && entry.safeName
+          ? `<button class="button button-danger button-small" type="button" data-uninstall-content="${escapeHtml(contentPath)}" ${canUninstall ? '' : 'disabled'}>${entry.name.toLowerCase().endsWith('.jar') ? 'Uninstall' : 'Remove file'}</button>`
+          : '';
+        return `<div class="file-entry file-entry-static"><span>${entry.type === 'directory' ? '▸' : '▤'}</span><span>${escapeHtml(entry.name)}</span><small>${entry.type === 'file' ? escapeHtml(bytes(entry.size)) : escapeHtml(entry.type)}</small>${action}</div>`;
+      }).join('')
       : '<div class="file-empty">No files found in this folder.</div>';
   } catch (error) {
     target.innerHTML = error.message.includes('not found') || error.message.includes('does not exist')
@@ -589,9 +856,36 @@ async function loadManagedContent(directory, targetId) {
   }
 }
 
+async function uninstallManagedContent(filename, button = null) {
+  const directory = state.manageTab === 'mods' ? 'mods' : state.manageTab === 'plugins' ? 'plugins' : '';
+  const server = state.servers.find((item) => item.id === state.adminServerId);
+  if (!directory || !server || !filename.startsWith(`${directory}/`)) return;
+  if (!['stopped', 'crashed'].includes(server.status)) {
+    toast('Stop the server before uninstalling content.', 'error');
+    return;
+  }
+  if (!confirm(`Uninstall ${filename.slice(directory.length + 1)} from ${server.name}?`)) return;
+  try {
+    await api(`/api/servers/${server.id}/file?path=${encodeURIComponent(filename)}`, { method: 'DELETE' });
+    if (button) {
+      delete button.dataset.uninstallContent;
+      button.textContent = 'Install latest compatible';
+    }
+    toast('Content uninstalled.');
+    await loadManagedContent(directory, directory === 'mods' ? 'manage-mod-files' : 'manage-plugin-files');
+    await refresh();
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
 async function searchManageContent(type, query, target) {
   const server = state.servers.find((item) => item.id === state.adminServerId);
   if (!server) return;
+  if (!supportsContent(server, type)) {
+    target.innerHTML = emptyState('Unavailable for this server', contentCompatibilityMessage(server, type));
+    return;
+  }
   const params = new URLSearchParams({
     query,
     type,
@@ -659,16 +953,20 @@ async function openManagedFile(filename) {
 }
 
 async function refreshConsole() {
-  if (!state.consoleServerId || !$('#admin-dialog').open) return;
+  if (!state.consoleServerId || !['console', 'logs'].includes(state.manageTab)) return;
   try {
     const entries = await api(`/api/servers/${state.consoleServerId}/logs`);
-    const output = $('#console-output');
-    const wasAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 40;
-    output.innerHTML = entries.map((entry) => `<div class="console-line ${['stderr', 'error'].includes(entry.source) ? 'stderr' : ''}"><span class="console-time">${escapeHtml(new Date(entry.timestamp).toLocaleTimeString())}</span> ${escapeHtml(entry.line)}</div>`).join('') || 'No process output yet. Start the server to see live logs.';
-    if (wasAtBottom) output.scrollTop = output.scrollHeight;
+    const markup = entries.map((entry) => `<div class="console-line ${['stderr', 'error'].includes(entry.source) ? 'stderr' : ''}"><span class="console-time">${escapeHtml(new Date(entry.timestamp).toLocaleTimeString())}</span> ${escapeHtml(entry.line)}</div>`).join('') || 'No process output yet. Start the server to see live logs.';
+    for (const output of [$('#console-output'), $('#server-log-output')]) {
+      if (!output) continue;
+      const wasAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 40;
+      output.innerHTML = markup;
+      if (wasAtBottom) output.scrollTop = output.scrollHeight;
+    }
   } catch (error) {
     toast(error.message, 'error');
     clearInterval(state.consoleLogInterval);
+    state.consoleLogInterval = null;
   }
 }
 
@@ -693,9 +991,10 @@ document.addEventListener('click', (event) => {
     closeButton.closest('dialog').close();
     return;
   }
-  const manageTab = event.target.closest('[data-manage-tab]');
-  if (manageTab) {
-    void activateManageTab(manageTab.dataset.manageTab);
+  const serverSection = event.target.closest('[data-server-section]');
+  if (serverSection) {
+    event.preventDefault();
+    navigateToServerSection(serverSection.dataset.serverSection);
     return;
   }
   const folderButton = event.target.closest('[data-open-server-folder]');
@@ -706,14 +1005,14 @@ document.addEventListener('click', (event) => {
     $('#file-editor').disabled = true;
     $('#file-save').disabled = true;
     $('#file-delete').disabled = true;
-    void activateManageTab('files');
+    navigateToServerSection('files');
     return;
   }
   const worldButton = event.target.closest('[data-open-world]');
   if (worldButton) {
     state.fileDirectory = worldButton.dataset.openWorld;
     state.selectedFile = '';
-    void activateManageTab('files');
+    navigateToServerSection('files');
     return;
   }
   if (event.target.closest('#worlds-refresh')) {
@@ -722,6 +1021,14 @@ document.addEventListener('click', (event) => {
   }
   if (event.target.closest('#logs-refresh')) {
     void refreshConsole();
+    return;
+  }
+  const uninstallButton = event.target.closest('[data-uninstall-content]');
+  if (uninstallButton) {
+    void uninstallManagedContent(
+      uninstallButton.dataset.uninstallContent,
+      uninstallButton.matches('[data-manage-modrinth-install]') ? uninstallButton : null
+    );
     return;
   }
   const actionButton = event.target.closest('[data-action]');
@@ -892,6 +1199,8 @@ $('#modrinth-search-form').addEventListener('submit', (event) => {
   event.preventDefault();
   void searchModrinth();
 });
+$('#modrinth-server').addEventListener('change', handleModrinthSelectionChange);
+$('#modrinth-type').addEventListener('change', handleModrinthSelectionChange);
 $$('[data-manage-search]').forEach((form) => form.addEventListener('submit', (event) => {
   event.preventDefault();
   const target = form.dataset.manageSearch === 'mod' ? $('#manage-mod-results') : $('#manage-plugin-results');
@@ -928,11 +1237,6 @@ $('#auth-logout').addEventListener('click', async () => {
   }
 });
 if (localStorage.getItem('bsp-theme') === 'light') document.body.classList.add('light');
-$('#admin-dialog').addEventListener('close', () => {
-  clearInterval(state.consoleLogInterval);
-  state.consoleServerId = null;
-  state.adminServerId = null;
-});
 window.addEventListener('hashchange', () => showPage(location.hash.slice(1) || 'overview'));
 showPage(location.hash.slice(1) || 'overview');
 void boot();

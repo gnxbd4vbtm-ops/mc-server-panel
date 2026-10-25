@@ -98,13 +98,23 @@ test('serves the dashboard and protects local API mutations from foreign origins
   assert.equal(page.status, 200);
   const pageMarkup = await page.text();
   assert.match(pageMarkup, /Byte Server Panel/);
-  for (const section of ['files', 'mods', 'plugins', 'worlds', 'console', 'logs']) {
-    assert.match(pageMarkup, new RegExp(`data-manage-tab="${section}"`));
+  for (const section of ['overview', 'files', 'mods', 'plugins', 'worlds', 'players', 'console', 'logs']) {
+    assert.match(pageMarkup, new RegExp(`data-server-section="${section}"`));
   }
-  assert.equal(pageMarkup.includes('console-dialog'), false);
+  assert.match(pageMarkup, /id="page-server"/);
+  assert.match(pageMarkup, /id="server-management-template"/);
+  assert.match(pageMarkup, /id="console-output"/);
+  assert.match(pageMarkup, /id="modrinth-compatibility"/);
+  assert.match(pageMarkup, /id="manage-players"/);
+  assert.match(pageMarkup, /<select name="minecraftVersion" id="create-version"/);
+  assert.equal(pageMarkup.includes('id="minecraft-versions"'), false);
+  assert.equal(pageMarkup.includes('id="admin-dialog"'), false);
   assert.equal(page.headers.get('content-security-policy')?.includes("frame-ancestors 'none'"), true);
   const appSource = await fetch(`${baseUrl}/app.js`).then((response) => response.text());
   assert.match(appSource, /class="delete-server-button"/);
+  assert.match(appSource, /const MODDED_SOFTWARE = new Set\(\['fabric', 'forge', 'neoforge', 'quilt'\]\)/);
+  assert.match(appSource, /const PLUGIN_SOFTWARE = new Set\(\['paper', 'purpur'\]\)/);
+  assert.match(appSource, /updateManagedContentCompatibility/);
   assert.equal(appSource.includes('>⋯</button>'), false);
 
   assert.equal((await fetch(`${baseUrl}/api/servers`)).status, 401);

@@ -460,7 +460,11 @@ async function fetchVerifiedFile(file, fetchImpl, signal, maxRedirects) {
     try {
       for (let redirects = 0; ; redirects += 1) {
         if (signal.aborted) throw abortError(signal);
-        const response = await fetchImpl(currentUrl.href, { signal, redirect: 'manual' });
+        const response = await fetchImpl(currentUrl.href, {
+          signal,
+          redirect: 'manual',
+          headers: { 'accept-encoding': 'identity' },
+        });
         if (response.status >= 300 && response.status < 400) {
           const location = response.headers.get('location');
           await response.body?.cancel().catch(() => {});

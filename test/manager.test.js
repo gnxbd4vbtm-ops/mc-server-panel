@@ -251,7 +251,8 @@ test('downloads only a Mojang-hosted jar and verifies its official SHA-1 and siz
     releaseTime: '2025-01-01T00:00:00+00:00',
     url: 'https://piston-meta.mojang.com/version.json'
   };
-  const fetch = async (value) => {
+  const fetch = async (value, options) => {
+    assert.equal(options.headers['accept-encoding'], 'identity');
     const url = String(value);
     if (url === 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json') {
       return Response.json({ versions: [release] });
@@ -332,7 +333,13 @@ test('attempts a checksum-verified Fabric install when the game version is absen
   const executable = path.join(root, 'fake-fabric-java');
   await writeFile(executable, `#!/bin/sh
 if [ "$1" = "-version" ]; then echo 'openjdk version "21.0.0"' >&2; exit 0; fi
-if [ "$1" = "-jar" ]; then : > fabric-server-launch.jar; exit 0; fi
+if [ "$1" = "-jar" ]; then
+  case "$2" in
+    *installer.jar) printf 'minecraft-server-jar' > server.jar; printf 'fabric-launcher-jar' > fabric-server-launch.jar ;;
+  esac
+  exit 0
+fi
+if [ "$3" = "-jar" ]; then printf '%s' "$4" > invoked-launch.txt; exit 0; fi
 exit 1
 `);
   await chmod(executable, 0o700);
@@ -367,8 +374,60 @@ exit 1
   const result = await manager.install(server.id, { confirmed: true });
   assert.equal(result.software, 'fabric');
   assert.equal(database.getServer(server.id).loaderVersion, '0.17.2');
-  assert.deepEqual(await readFile(path.join(database.getServer(server.id).directory, 'server.jar')), Buffer.from(''));
+  const serverDirectory = database.getServer(server.id).directory;
+  assert.deepEqual(await readFile(path.join(serverDirectory, 'server.jar')), Buffer.from('minecraft-server-jar'));
+  assert.deepEqual(await readFile(path.join(serverDirectory, 'fabric-server-launch.jar')), Buffer.from('fabric-launcher-jar'));
+  await manager.start(server.id, { acceptEula: true });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(await readFile(path.join(serverDirectory, 'invoked-launch.txt'), 'utf8'),
+    path.join(serverDirectory, 'fabric-server-launch.jar'));
   assert.deepEqual((await readdir(manager.serverDir)).filter((name) => name.startsWith('.provider-stage-')), []);
+});
+
+test('repairs Fabric installs that replaced the Minecraft server jar with the loader launcher', async () => {
+  const { root, manager, database } = await makeManager();
+  const executable = path.join(root, 'fake-repair-java');
+  await writeFile(executable, `#!/bin/sh
+if [ "$1" = "-version" ]; then echo 'openjdk version "21.0.0"' >&2; exit 0; fi
+if [ "$3" = "-jar" ]; then printf '%s' "$4" > invoked-launch.txt; exit 0; fi
+exit 1
+`);
+  await chmod(executable, 0o700);
+  const serverBytes = Buffer.from('verified-minecraft-server-jar');
+  const release = { id: '1.21.8', url: 'https://piston-meta.mojang.com/version.json' };
+  manager.fetch = async (value, options) => {
+    assert.equal(options.headers['accept-encoding'], 'identity');
+    const url = String(value);
+    if (url.endsWith('version_manifest_v2.json')) return Response.json({ versions: [release] });
+    if (url === release.url) return Response.json({
+      downloads: { server: {
+        url: 'https://piston-data.mojang.com/server.jar',
+        size: serverBytes.length,
+        sha1: createHash('sha1').update(serverBytes).digest('hex')
+      } }
+    });
+    if (url === 'https://piston-data.mojang.com/server.jar') return new Response(serverBytes);
+    throw new Error(`Unexpected URL ${url}`);
+  };
+  const server = await manager.createServer({
+    name: 'Broken Fabric legacy',
+    minecraftVersion: '1.21.8',
+    software: 'fabric',
+    javaPath: executable,
+    port: await availablePort(),
+    memoryMb: 512
+  });
+  const legacyLauncher = Buffer.from([0x50, 0x4b, 0x03, 0x04, ...Buffer.from('legacy fabric launcher')]);
+  await writeFile(path.join(database.getServer(server.id).directory, 'server.jar'), legacyLauncher);
+  database.updateServer(server.id, { installed: 1, eula_accepted: 1 });
+
+  await manager.start(server.id);
+  const directory = database.getServer(server.id).directory;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(await readFile(path.join(directory, 'server.jar')), serverBytes);
+  assert.deepEqual(await readFile(path.join(directory, 'fabric-server-launch.jar')), legacyLauncher);
+  assert.equal(await readFile(path.join(directory, 'invoked-launch.txt'), 'utf8'),
+    path.join(directory, 'fabric-server-launch.jar'));
 });
 
 test('imports a verified Modrinth server pack without replacing managed configuration', async () => {
@@ -462,6 +521,33 @@ test('installs Modrinth mods only for compatible loaders and hashes', async () =
   await assert.rejects(manager.installModrinthContent(server.id, {
     contentType: 'mod', versionId: 'version123'
   }), /already exists/);
+});
+
+test('rejects Modrinth plugins on Fabric and mods on Paper', async () => {
+  const { manager, database } = await makeManager();
+  const fabric = await manager.createServer({
+    name: 'Fabric compatibility test',
+    minecraftVersion: '1.21.8',
+    software: 'fabric',
+    port: await availablePort(),
+    memoryMb: 512
+  });
+  const paper = await manager.createServer({
+    name: 'Paper compatibility test',
+    minecraftVersion: '1.21.8',
+    software: 'paper',
+    port: await availablePort(),
+    memoryMb: 512
+  });
+  database.updateServer(fabric.id, { installed: 1 });
+  database.updateServer(paper.id, { installed: 1 });
+
+  await assert.rejects(manager.installModrinthContent(fabric.id, {
+    contentType: 'plugin', versionId: 'plugin-version'
+  }), /Plugins require a Paper or Purpur server/);
+  await assert.rejects(manager.installModrinthContent(paper.id, {
+    contentType: 'mod', versionId: 'mod-version'
+  }), /Mods require a Fabric, Forge, NeoForge, or Quilt server/);
 });
 
 test('rejects non-Mojang download URLs without writing a server jar', async () => {
