@@ -750,6 +750,60 @@ test('applies per-server backup retention and deletes archived backups', async (
   assert.deepEqual(database.listBackups(server.id), []);
 });
 
+test('reads and updates safe server-wide settings without exposing managed RCON credentials', async () => {
+  const { manager, database } = await makeManager();
+  const server = await manager.createServer({
+    name: 'Server settings',
+    minecraftVersion: '1.21.8',
+    port: await availablePort(),
+    memoryMb: 512
+  });
+  const internal = database.getServer(server.id);
+  database.updateServer(server.id, { installed: 1 });
+  const secret = await manager.ensureRconConfiguration(internal);
+  await writeFile(path.join(internal.directory, 'server.properties'), [
+    '# Keep this comment',
+    'motd=Preserve this message',
+    'difficulty=hard',
+    'max-players=12',
+    'max-players=16',
+    `rcon.password=${secret}`,
+    ''
+  ].join('\n'));
+
+  const current = await manager.getServerSettings(server.id);
+  assert.equal(current.difficulty, 'hard');
+  assert.equal(current.hardcore, false);
+  assert.equal(current.maxPlayers, 16);
+  assert.equal(current.onlineMode, true);
+  assert.equal(current.whitelist, false);
+  assert.equal('rconPassword' in current, false);
+
+  const result = await manager.updateServerSettings(server.id, {
+    difficulty: 'normal',
+    hardcore: true,
+    whitelist: true,
+    maxPlayers: 40,
+    spawnProtection: 0,
+    onlineMode: false
+  });
+  const properties = await readFile(path.join(internal.directory, 'server.properties'), 'utf8');
+  assert.equal(result.restartRequired, true);
+  assert.equal(result.settings.difficulty, 'normal');
+  assert.equal(result.settings.hardcore, true);
+  assert.equal(result.settings.whitelist, true);
+  assert.equal(result.settings.maxPlayers, 40);
+  assert.equal(properties.includes('# Keep this comment'), true);
+  assert.equal(properties.includes('motd=Preserve this message'), true);
+  assert.match(properties, /^hardcore=true$/m);
+  assert.equal(properties.includes(`rcon.password=${secret}`), true);
+  assert.equal((properties.match(/^max-players=/gm) ?? []).length, 1);
+  await assert.rejects(manager.updateServerSettings(server.id, { maxPlayers: 0 }), /whole number from 1 to 100000/);
+  await assert.rejects(manager.updateServerSettings(server.id, { 'rcon.password': 'exposed' }), /Unsupported server setting/);
+  database.updateServer(server.id, { status: 'running' });
+  await assert.rejects(manager.updateServerSettings(server.id, { whitelist: false }), /Stop and verify/);
+});
+
 test('starts a local process once, sends commands, and stops gracefully', async () => {
   const { manager, database } = await makeManager();
   const executable = await fakeJava(fixtures.at(-1), 'test-java');
@@ -771,6 +825,29 @@ test('starts a local process once, sends commands, and stops gracefully', async 
   await manager.stop(server.id);
   await waitFor(() => database.getServer(server.id).status === 'stopped');
   assert.equal((await manager.getLogs(server.id)).some((entry) => entry.line.includes('Done (test)')), true);
+});
+
+test('gracefully restarts a running server and waits until the replacement is ready', async () => {
+  const { root, manager, database } = await makeManager();
+  const executable = await fakeJava(root, 'test-java-restart');
+  const server = await manager.createServer({
+    name: 'Restart test',
+    minecraftVersion: '1.21.8',
+    port: await availablePort(),
+    memoryMb: 512,
+    javaPath: executable
+  });
+  database.updateServer(server.id, { installed: 1, eula_accepted: 1 });
+  await manager.start(server.id);
+  await waitFor(() => database.getServer(server.id).status === 'running');
+
+  const result = await manager.restart(server.id);
+  assert.equal(result.status, 'starting');
+  assert.equal(result.restarted, true);
+  await waitFor(() => database.getServer(server.id).status === 'running');
+  assert.equal((await manager.getLogs(server.id)).filter((entry) => entry.line.includes('Done (test)')).length >= 2, true);
+  await manager.stop(server.id);
+  await waitFor(() => database.getServer(server.id).status === 'stopped');
 });
 
 test('returns administration command output from the server process', async () => {

@@ -106,6 +106,11 @@ test('serves the dashboard and protects local API mutations from foreign origins
   assert.match(pageMarkup, /id="console-output"/);
   assert.match(pageMarkup, /id="modrinth-compatibility"/);
   assert.match(pageMarkup, /id="manage-players"/);
+  assert.match(pageMarkup, /id="overview-settings-form"/);
+  assert.match(pageMarkup, /id="server-page-restart"/);
+  assert.match(pageMarkup, /name="spawnProtection"/);
+  assert.match(pageMarkup, /name="onlineMode"/);
+  assert.match(pageMarkup, /name="hardcore"/);
   assert.match(pageMarkup, /id="runtime-change-form"/);
   assert.match(pageMarkup, /id="admin-action-description"/);
   assert.match(pageMarkup, /<select name="minecraftVersion" id="create-version"/);
@@ -158,6 +163,20 @@ test('serves the dashboard and protects local API mutations from foreign origins
 
   database.updateServer(serverData.id, { installed: 1 });
   await manager.ensureRconConfiguration(database.getServer(serverData.id));
+  const initialSettingsResponse = await localFetch(`${baseUrl}/api/servers/${serverData.id}/settings`);
+  assert.equal(initialSettingsResponse.status, 200);
+  assert.equal((await initialSettingsResponse.json()).onlineMode, true);
+  const updatedSettingsResponse = await localFetch(`${baseUrl}/api/servers/${serverData.id}/settings`, {
+    method: 'PUT',
+    headers: { Origin: baseUrl, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ maxPlayers: 32, whitelist: true, hardcore: true })
+  });
+  assert.equal(updatedSettingsResponse.status, 200);
+  const updatedSettings = await updatedSettingsResponse.json();
+  assert.equal(updatedSettings.settings.maxPlayers, 32);
+  assert.equal(updatedSettings.settings.whitelist, true);
+  assert.equal(updatedSettings.settings.hardcore, true);
+  assert.equal(updatedSettings.restartRequired, true);
   const createdFile = await localFetch(`${baseUrl}/api/servers/${serverData.id}/files`, {
     method: 'POST',
     headers: { Origin: baseUrl, 'Content-Type': 'application/json' },
@@ -200,6 +219,12 @@ test('serves the dashboard and protects local API mutations from foreign origins
   assert.deepEqual(commands, ['op TestPlayer\n']);
   manager.runtime.delete(serverData.id);
   database.updateServer(serverData.id, { status: 'stopped' });
+  const restartWhileStopped = await localFetch(`${baseUrl}/api/servers/${serverData.id}/restart`, {
+    method: 'POST',
+    headers: { Origin: baseUrl, 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+  assert.equal(restartWhileStopped.status, 400);
 
   const schedule = await localFetch(`${baseUrl}/api/servers/${serverData.id}/schedules`, {
     method: 'POST',

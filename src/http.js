@@ -230,6 +230,14 @@ async function handleApi(request, response, manager, port, auth, secure) {
     sendJson(response, 200, manager.getMetrics(id, url.searchParams.get('limit') ?? 1440));
     return;
   }
+  if (action === 'settings' && method === 'GET') {
+    sendJson(response, 200, await manager.getServerSettings(id));
+    return;
+  }
+  if (action === 'settings' && method === 'PUT') {
+    sendJson(response, 200, await manager.updateServerSettings(id, await readJson(request)));
+    return;
+  }
   if (action === 'files' && method === 'GET') {
     sendJson(response, 200, await manager.listServerFiles(id, url.searchParams.get('path') ?? ''));
     return;
@@ -277,6 +285,10 @@ async function handleApi(request, response, manager, port, auth, secure) {
   }
   if (action === 'stop' && method === 'POST') {
     sendJson(response, 202, await manager.stop(id));
+    return;
+  }
+  if (action === 'restart' && method === 'POST') {
+    sendJson(response, 202, await manager.restart(id));
     return;
   }
   if (action === 'force-stop' && method === 'POST') {

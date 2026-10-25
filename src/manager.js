@@ -24,6 +24,38 @@ const VERSION_MANIFEST_URL = 'https://piston-meta.mojang.com/mc/game/version_man
 const ALLOWED_DOWNLOAD_HOSTS = new Set(['piston-meta.mojang.com', 'piston-data.mojang.com', 'launcher.mojang.com']);
 const MAX_MEMORY_FRACTION = 0.8;
 const SERVER_SOFTWARE = new Set(['vanilla', 'fabric', 'forge', 'neoforge', 'quilt', 'paper', 'purpur']);
+const SERVER_PROPERTY_SETTINGS = new Map([
+  ['difficulty', { property: 'difficulty', type: 'choice', choices: ['peaceful', 'easy', 'normal', 'hard'] }],
+  ['hardcore', { property: 'hardcore', type: 'boolean' }],
+  ['whitelist', { property: 'white-list', type: 'boolean' }],
+  ['onlineMode', { property: 'online-mode', type: 'boolean' }],
+  ['maxPlayers', { property: 'max-players', type: 'integer', min: 1, max: 100000 }],
+  ['gamemode', { property: 'gamemode', type: 'choice', choices: ['survival', 'creative', 'adventure', 'spectator'] }],
+  ['spawnProtection', { property: 'spawn-protection', type: 'integer', min: 0, max: 100000 }],
+  ['pvp', { property: 'pvp', type: 'boolean' }],
+  ['allowNether', { property: 'allow-nether', type: 'boolean' }],
+  ['viewDistance', { property: 'view-distance', type: 'integer', min: 2, max: 32 }],
+  ['simulationDistance', { property: 'simulation-distance', type: 'integer', min: 2, max: 32 }],
+  ['allowFlight', { property: 'allow-flight', type: 'boolean' }],
+  ['commandBlocks', { property: 'enable-command-block', type: 'boolean' }],
+  ['forceGamemode', { property: 'force-gamemode', type: 'boolean' }]
+]);
+const DEFAULT_SERVER_SETTINGS = Object.freeze({
+  difficulty: 'easy',
+  hardcore: false,
+  whitelist: false,
+  onlineMode: true,
+  maxPlayers: 20,
+  gamemode: 'survival',
+  spawnProtection: 16,
+  pvp: true,
+  allowNether: true,
+  viewDistance: 10,
+  simulationDistance: 10,
+  allowFlight: false,
+  commandBlocks: false,
+  forceGamemode: false
+});
 
 export class ServerManager {
   constructor(database, options = {}) {
@@ -957,10 +989,7 @@ export class ServerManager {
       this.db.addEvent(server.id, 'info', 'Requested server stop from recurring schedule.');
       return;
     }
-    if (['running', 'starting'].includes(server.status)) await this.stop(server.id);
-    await waitForStatus(() => this.db.getServer(server.id)?.status === 'stopped', 30000);
-    await this.start(server.id);
-    this.db.addEvent(server.id, 'info', 'Restarted server from recurring schedule.');
+    await this.restart(server.id);
   }
 
   async diagnostics() {
@@ -1214,6 +1243,19 @@ export class ServerManager {
     return { status: force ? 'stopping' : 'stopping', server: server.name };
   }
 
+  async restart(id) {
+    const server = this.requireServer(id);
+    if (!server.installed) throw clientError('Install the server before restarting it.');
+    if (!['running', 'starting', 'orphaned'].includes(server.status)) {
+      throw clientError('The server must be running before it can be restarted.');
+    }
+    await this.stop(id);
+    await waitForStatus(() => this.db.getServer(id)?.status === 'stopped', 30000);
+    const result = await this.start(id);
+    this.db.addEvent(id, 'info', 'Restarted server.');
+    return { ...result, restarted: true };
+  }
+
   confirmStopped(id, options = {}) {
     requireObject(options, 'Process-state confirmation');
     if (options.confirmed !== true) throw clientError('Explicit confirmation is required before changing the process state.', 403);
@@ -1318,6 +1360,50 @@ export class ServerManager {
     await managedFileOperation(() => deleteManagedFile(server.directory, filename));
     this.db.addEvent(id, 'warning', `Deleted server file ${filename}.`);
     return { deleted: true };
+  }
+
+  async getServerSettings(id) {
+    const server = this.requireServer(id);
+    if (!server.installed) throw clientError('Install the server before changing server settings.', 409);
+    const content = await managedFileOperation(() => readManagedFile(server.directory, 'server.properties'));
+    const text = content.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(content)) {
+      throw clientError('server.properties is not valid UTF-8 text.', 415);
+    }
+    const properties = new Map();
+    for (const line of text.split(/\r?\n/)) {
+      if (!line || line.startsWith('#') || line.startsWith('!')) continue;
+      const separator = line.indexOf('=');
+      if (separator < 1) continue;
+      properties.set(line.slice(0, separator), line.slice(separator + 1));
+    }
+    return Object.fromEntries([...SERVER_PROPERTY_SETTINGS].map(([name, definition]) => [
+      name,
+      parseServerProperty(name, properties.get(definition.property), definition)
+    ]));
+  }
+
+  async updateServerSettings(id, input) {
+    requireObject(input, 'Server settings');
+    const server = this.requireServer(id);
+    if (!server.installed) throw clientError('Install the server before changing server settings.', 409);
+    this.assertServerFilesStopped(server);
+    const updates = new Map();
+    for (const [name, value] of Object.entries(input)) {
+      const definition = SERVER_PROPERTY_SETTINGS.get(name);
+      if (!definition) throw clientError(`Unsupported server setting "${name}".`);
+      updates.set(definition.property, validateServerSetting(name, value, definition));
+    }
+    if (!updates.size) throw clientError('Choose at least one server setting to update.');
+    const content = await managedFileOperation(() => readManagedFile(server.directory, 'server.properties'));
+    const text = content.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(content)) {
+      throw clientError('server.properties is not valid UTF-8 text.', 415);
+    }
+    const written = updateServerProperties(text, updates);
+    await managedFileOperation(() => writeManagedFile(server.directory, 'server.properties', written));
+    this.db.addEvent(id, 'info', `Updated server settings: ${Object.keys(input).join(', ')}. Changes apply when the server starts.`);
+    return { settings: await this.getServerSettings(id), restartRequired: true };
   }
 
   assertServerFilesStopped(server) {
@@ -1687,6 +1773,56 @@ function validateText(value, label, min, max) {
     throw clientError(`${label} must be ${min}-${max} characters and cannot contain newlines.`);
   }
   return value.trim();
+}
+
+function parseServerProperty(name, rawValue, definition) {
+  if (rawValue === undefined) return DEFAULT_SERVER_SETTINGS[name];
+  if (definition.type === 'boolean') {
+    if (rawValue.toLowerCase() === 'true') return true;
+    if (rawValue.toLowerCase() === 'false') return false;
+  } else if (definition.type === 'integer' && /^\d+$/.test(rawValue)) {
+    const value = Number(rawValue);
+    if (Number.isSafeInteger(value) && value >= definition.min && value <= definition.max) return value;
+  } else if (definition.type === 'choice' && definition.choices.includes(rawValue.toLowerCase())) {
+    return rawValue.toLowerCase();
+  }
+  throw clientError(`server.properties contains an invalid value for "${definition.property}".`, 422);
+}
+
+function validateServerSetting(name, value, definition) {
+  if (definition.type === 'boolean' && typeof value === 'boolean') return String(value);
+  if (definition.type === 'integer' && Number.isSafeInteger(value)
+      && value >= definition.min && value <= definition.max) return String(value);
+  if (definition.type === 'choice' && typeof value === 'string'
+      && definition.choices.includes(value)) return value;
+  if (definition.type === 'integer') {
+    throw clientError(`${name} must be a whole number from ${definition.min} to ${definition.max}.`, 422);
+  }
+  if (definition.type === 'choice') {
+    throw clientError(`${name} must be one of: ${definition.choices.join(', ')}.`, 422);
+  }
+  throw clientError(`${name} must be true or false.`, 422);
+}
+
+function updateServerProperties(text, updates) {
+  const lines = text.split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop();
+  const updated = new Set();
+  const result = [];
+  for (const line of lines) {
+    const separator = line.indexOf('=');
+    const key = separator > 0 ? line.slice(0, separator) : null;
+    if (!updates.has(key)) {
+      result.push(line);
+      continue;
+    }
+    if (!updated.has(key)) result.push(`${key}=${updates.get(key)}`);
+    updated.add(key);
+  }
+  for (const [key, value] of updates) {
+    if (!updated.has(key)) result.push(`${key}=${value}`);
+  }
+  return `${result.join('\n')}\n`;
 }
 
 function requireObject(value, label) {

@@ -21,6 +21,7 @@ const state = {
 };
 let runtimeCompatibilityRequest = 0;
 let runtimeSettingsServerId = null;
+let overviewSettingsRequest = 0;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -527,6 +528,9 @@ function showPage(route) {
         ? 'Stop server'
         : server.status === 'unknown' ? 'Confirm stopped' : 'Start server';
     actionButton.disabled = !server;
+    const restartButton = $('#server-page-restart');
+    restartButton.dataset.id = serverId;
+    restartButton.hidden = !server?.installed || !['running', 'starting', 'orphaned'].includes(server.status);
     $('#server-page-backup').dataset.action = 'backup';
     $('#server-page-backup').dataset.id = serverId;
     $('#server-page-backup').hidden = !server?.installed || !['stopped', 'crashed'].includes(server.status);
@@ -537,6 +541,7 @@ function showPage(route) {
     $('#server-detail-disk').textContent = server ? bytes(server.diskBytes) : '—';
     $('#server-detail-port').textContent = server?.port ?? '—';
     $('#server-detail-memory').textContent = server ? `${server.memoryMb} MB` : '—';
+    updateOverviewSettingsAvailability(server);
     $('#server-detail-events').innerHTML = state.events
       .filter((event) => event.server_id === serverId || event.serverId === serverId)
       .slice(0, 8)
@@ -654,6 +659,52 @@ async function updateProviderCatalogHint() {
       : `${software} does not support Minecraft ${version}. Installation will be stopped before downloading; choose Vanilla or compatible server software.`;
   } catch (error) {
     hint.textContent = `Could not check ${software} compatibility. The version remains selectable; installation will be attempted and may fail. (${error.message})`;
+  }
+}
+
+function updateOverviewSettingsAvailability(server) {
+  const form = $('#overview-settings-form');
+  const available = Boolean(
+    server?.installed
+    && form.dataset.loadedServer === server.id
+    && ['stopped', 'crashed'].includes(server.status)
+  );
+  for (const control of form.elements) control.disabled = !available;
+  $('[form="overview-settings-form"]').disabled = !available;
+  if (!server?.installed) {
+    form.dataset.loadedServer = '';
+    $('#overview-settings-status').textContent = 'Install the server to edit its settings.';
+  } else if (!available) {
+    $('#overview-settings-status').textContent = ['stopped', 'crashed'].includes(server.status)
+      ? 'Loading settings before they can be edited.'
+      : 'Stop the server before editing settings. Saved changes apply the next time it starts.';
+  }
+}
+
+async function loadOverviewSettings() {
+  const serverId = state.adminServerId;
+  const server = state.servers.find((item) => item.id === serverId);
+  const request = ++overviewSettingsRequest;
+  if (!server?.installed) {
+    updateOverviewSettingsAvailability(server);
+    return;
+  }
+  $('#overview-settings-form').dataset.loadedServer = '';
+  updateOverviewSettingsAvailability(server);
+  $('#overview-settings-status').textContent = 'Loading server settings…';
+  try {
+    const settings = await api(`/api/servers/${encodeURIComponent(serverId)}/settings`);
+    if (request !== overviewSettingsRequest || state.adminServerId !== serverId) return;
+    const form = $('#overview-settings-form');
+    for (const [name, value] of Object.entries(settings)) {
+      form.elements[name].value = String(value);
+    }
+    form.dataset.loadedServer = serverId;
+    $('#overview-settings-status').textContent = 'Settings loaded.';
+    updateOverviewSettingsAvailability(server);
+  } catch (error) {
+    if (request !== overviewSettingsRequest || state.adminServerId !== serverId) return;
+    $('#overview-settings-status').textContent = `Could not load server settings: ${error.message}`;
   }
 }
 
@@ -899,6 +950,10 @@ async function runAction(action, id, backupId = null) {
       if (server.status !== 'running' && !confirm(`The server is ${server.status}. Request a graceful stop?`)) return;
       await api(`/api/servers/${id}/stop`, { method: 'POST', body: '{}' });
       toast(`Graceful shutdown requested for ${server.name}.`);
+    } else if (action === 'restart') {
+      if (!confirm(`Gracefully stop and restart "${server.name}"? The server will save the world before shutting down.`)) return;
+      await api(`/api/servers/${id}/restart`, { method: 'POST', body: '{}' });
+      toast(`Restart requested for ${server.name}.`);
     } else if (action === 'force-stop') {
       if (!confirm(`Force-stop "${server.name}"? The server will not be able to save its world; unsaved changes may be lost.`)) return;
       await api(`/api/servers/${id}/force-stop`, { method: 'POST', body: JSON.stringify({ confirmed: true }) });
@@ -953,6 +1008,7 @@ async function activateManageTab(tab) {
   if (!allowed.has(tab)) tab = 'files';
   state.manageTab = tab;
   updateManagedContentCompatibility();
+  if (tab === 'overview') void loadOverviewSettings();
   if (tab === 'settings') populateRuntimeSettings();
   if (tab === 'players') updateAdminActionFields();
   for (const link of $$('[data-server-section]')) {
@@ -1216,6 +1272,37 @@ document.addEventListener('click', (event) => {
 $('#create-form').addEventListener('submit', (event) => {
   event.preventDefault();
   void createServer(event.currentTarget);
+});
+$('#overview-settings-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const serverId = state.adminServerId;
+  const status = $('#overview-settings-status');
+  const submit = $('[form="overview-settings-form"]');
+  const values = Object.fromEntries(new FormData(form));
+  for (const name of ['hardcore', 'whitelist', 'onlineMode', 'pvp', 'allowNether', 'allowFlight', 'commandBlocks', 'forceGamemode']) {
+    values[name] = values[name] === 'true';
+  }
+  for (const name of ['maxPlayers', 'spawnProtection', 'viewDistance', 'simulationDistance']) {
+    values[name] = Number(values[name]);
+  }
+  submit.disabled = true;
+  status.textContent = 'Saving server settings…';
+  try {
+    const result = await api(`/api/servers/${encodeURIComponent(serverId)}/settings`, {
+      method: 'PUT',
+      body: JSON.stringify(values)
+    });
+    for (const [name, value] of Object.entries(result.settings)) {
+      form.elements[name].value = String(value);
+    }
+    status.textContent = 'Settings saved. They will take effect when the server starts.';
+    await refresh();
+  } catch (error) {
+    status.textContent = `Could not save server settings: ${error.message}`;
+  } finally {
+    updateOverviewSettingsAvailability(state.servers.find((server) => server.id === serverId));
+  }
 });
 $('#runtime-version').addEventListener('change', () => void updateRuntimeCompatibilityHint());
 $('#runtime-software').addEventListener('change', () => void updateRuntimeCompatibilityHint());

@@ -151,7 +151,7 @@
         <section id="page-server" class="page" aria-labelledby="admin-title">
           <div class="page-heading server-page-heading">
             <div><div class="eyebrow">SERVER MANAGEMENT</div><h1 id="admin-title">Manage server</h1><p id="server-page-description" class="page-description"></p></div>
-            <div class="server-page-actions"><span id="server-page-status" class="status-pill"></span><button id="server-page-action" class="button button-primary button-small" type="button"></button><button id="server-page-backup" class="button button-secondary button-small" type="button">Backup</button></div>
+            <div class="server-page-actions"><span id="server-page-status" class="status-pill"></span><button id="server-page-action" class="button button-primary button-small" type="button"></button><button id="server-page-restart" class="button button-secondary button-small" type="button" data-action="restart" hidden>Restart</button><button id="server-page-backup" class="button button-secondary button-small" type="button">Backup</button></div>
           </div>
           <div id="server-page-overview" class="manage-panel active">
             <div class="server-detail-grid">
@@ -162,7 +162,31 @@
               <article class="stat-card"><div class="stat-top">Server port</div><strong id="server-detail-port">—</strong><small>Java edition port</small></article>
               <article class="stat-card"><div class="stat-top">Memory limit</div><strong id="server-detail-memory">—</strong><small>Maximum Java heap</small></article>
             </div>
-            <div class="section-heading"><div><h2>Recent server activity</h2><p>Latest events for this server.</p></div></div>
+              <section class="overview-server-settings">
+                <div class="manage-section-heading">
+                  <div><h3>Quick server settings</h3><p>Common world and player options. Updates are saved to server.properties and apply the next time the server starts.</p></div>
+                  <button class="button button-primary button-small" type="submit" form="overview-settings-form">Save settings</button>
+                </div>
+                <form id="overview-settings-form" class="overview-settings-form">
+                  <label class="field">Difficulty<select name="difficulty"><option value="peaceful">Peaceful</option><option value="easy">Easy</option><option value="normal">Normal</option><option value="hard">Hard</option></select></label>
+                  <label class="field">Hardcore<select name="hardcore"><option value="false">Off</option><option value="true">On — one life, hard difficulty</option></select></label>
+                  <label class="field">Default gamemode<select name="gamemode"><option value="survival">Survival</option><option value="creative">Creative</option><option value="adventure">Adventure</option><option value="spectator">Spectator</option></select></label>
+                  <label class="field">Maximum players<input name="maxPlayers" type="number" min="1" max="100000" required></label>
+                  <label class="field">Spawn protection radius<input name="spawnProtection" type="number" min="0" max="100000" required></label>
+                  <label class="field">View distance<input name="viewDistance" type="number" min="2" max="32" required></label>
+                  <label class="field">Simulation distance<input name="simulationDistance" type="number" min="2" max="32" required></label>
+                  <label class="field">Whitelist<select name="whitelist"><option value="false">Off — anyone may join</option><option value="true">On — approved players only</option></select></label>
+                  <label class="field">Online mode<select name="onlineMode"><option value="true">On — authenticate accounts</option><option value="false">Off — private networks only</option></select></label>
+                  <label class="field">Player vs player<select name="pvp"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
+                  <label class="field">Allow Nether<select name="allowNether"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
+                  <label class="field">Allow flight<select name="allowFlight"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
+                  <label class="field">Command blocks<select name="commandBlocks"><option value="false">Disabled</option><option value="true">Enabled</option></select></label>
+                  <label class="field">Force default gamemode<select name="forceGamemode"><option value="false">No</option><option value="true">Yes</option></select></label>
+                </form>
+                <p class="overview-settings-warning">Online mode off disables account authentication. Use only on a trusted private network.</p>
+                <p id="overview-settings-status" class="overview-settings-status" role="status"></p>
+              </section>
+              <div class="section-heading"><div><h2>Recent server activity</h2><p>Latest events for this server.</p></div></div>
             <div id="server-detail-events" class="event-list"></div>
           </div>
           <div id="server-page-sections"></div>
