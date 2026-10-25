@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { request as httpRequest } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +10,29 @@ import { createHttpServer } from '../src/http.js';
 import { ServerManager } from '../src/manager.js';
 
 const fixtures = [];
+
+function requestThroughProxy(port, requestPath, options = {}) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      hostname: '127.0.0.1',
+      port,
+      path: requestPath,
+      method: options.method ?? 'GET',
+      headers: options.headers
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({
+        status: response.statusCode,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString('utf8')
+      }));
+    });
+    request.once('error', reject);
+    if (options.body) request.write(options.body);
+    request.end();
+  });
+}
 
 async function availablePort() {
   const { createServer } = await import('node:net');
@@ -64,7 +88,9 @@ test('serves the dashboard and protects local API mutations from foreign origins
   await manager.initialize();
   const auth = new AuthService(database);
   const setupToken = await auth.initialize();
-  const server = createHttpServer(manager, { host: '127.0.0.1', port }, auth);
+  const server = createHttpServer(manager, {
+    host: '127.0.0.1', port, allowedHosts: ['panel.example.test'], trustProxy: true
+  }, auth);
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.once('listening', resolve);
@@ -79,6 +105,27 @@ test('serves the dashboard and protects local API mutations from foreign origins
   });
   assert.equal(setupResponse.status, 200);
   const sessionCookie = setupResponse.headers.get('set-cookie').split(';')[0];
+  const proxyLogin = await requestThroughProxy(port, '/api/auth/login', {
+    method: 'POST',
+    headers: {
+      Host: 'panel.example.test',
+      Origin: 'https://panel.example.test',
+      'X-Forwarded-Proto': 'https',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ password: 'test-admin-password-123' })
+  });
+  assert.equal(proxyLogin.status, 200, proxyLogin.body);
+  assert.match(proxyLogin.headers['set-cookie'][0], /;\s*Secure(?:;|$)/i);
+  assert.equal(proxyLogin.headers['strict-transport-security'], 'max-age=31536000');
+  const proxyPage = await requestThroughProxy(port, '/', {
+    headers: { Host: 'panel.example.test', 'X-Forwarded-Proto': 'https' }
+  });
+  assert.equal(proxyPage.status, 200);
+  const rejectedHost = await requestThroughProxy(port, '/', {
+    headers: { Host: 'untrusted.example.test' }
+  });
+  assert.equal(rejectedHost.status, 403);
   const localFetch = (url, options = {}) => fetch(url, {
     ...options,
     headers: { ...options.headers, Cookie: sessionCookie }

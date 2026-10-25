@@ -1,0 +1,25 @@
+[Unit]
+Description=Byte Server Panel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=byte
+Group=byte
+WorkingDirectory=/home/byte/Projects/mc-server-panel
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="NODE_ENV=production"
+Environment="BSP_HOST=127.0.0.1"
+Environment="BSP_PORT=18765"
+Environment="BSP_ALLOWED_HOSTS=panel.example.com"
+Environment="BSP_TRUST_PROXY=true"
+UMask=0077
+ExecStartPre=npm run build
+ExecStart=node src/main.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

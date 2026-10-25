@@ -16,29 +16,35 @@ const MIME_TYPES = new Map([
   ['.json', 'application/json; charset=utf-8'],
   ['.svg', 'image/svg+xml']
 ]);
-export function createHttpServer(manager, { host, port, tls, allowedHosts = [] }, auth = new AuthService(manager.db)) {
+export function createHttpServer(manager, {
+  host, port, tls, allowedHosts = [], trustProxy = false
+}, auth = new AuthService(manager.db)) {
   const server = tls
-    ? createHttpsServer(tls, requestHandler(manager, { host, port, tls, allowedHosts }, auth))
-    : createServer(requestHandler(manager, { host, port, tls, allowedHosts }, auth));
+    ? createHttpsServer(tls, requestHandler(manager, { host, port, tls, allowedHosts, trustProxy }, auth))
+    : createServer(requestHandler(manager, { host, port, tls, allowedHosts, trustProxy }, auth));
   return server.listen(port, host);
 }
 
-function requestHandler(manager, { host, port, tls, allowedHosts }, auth) {
+function requestHandler(manager, { host, port, tls, allowedHosts, trustProxy }, auth) {
   const knownHosts = new Set([
     '127.0.0.1', 'localhost', '[::1]', '::1',
     ...(host === '0.0.0.0' || host === '::' ? localInterfaceAddresses() : [host]),
-    ...allowedHosts
+    ...allowedHosts.map((name) => name.toLowerCase())
   ]);
   return async (request, response) => {
-    applySecurityHeaders(response, Boolean(tls));
+    const trustedProxy = trustProxy && isLoopbackAddress(request.socket.remoteAddress);
+    const proxyHttps = trustedProxy && request.headers['x-forwarded-proto'] === 'https';
+    const secure = Boolean(request.socket.encrypted) || proxyHttps;
     try {
-      assertAllowedHost(request, port, knownHosts);
+      assertAllowedHost(request, port, knownHosts, proxyHttps);
+      applySecurityHeaders(response, secure);
       if (request.url?.startsWith('/api/')) {
-        await handleApi(request, response, manager, port, auth, Boolean(tls));
+        await handleApi(request, response, manager, port, auth, secure);
       } else {
         await serveStatic(request, response);
       }
     } catch (error) {
+      applySecurityHeaders(response, secure);
       const status = Number.isInteger(error.status) ? error.status : 500;
       if (status >= 500) console.error(`[http] ${request.method} ${request.url}:`, error);
       sendJson(response, status, { error: status === 500 ? 'The request could not be completed.' : error.message });
@@ -47,7 +53,7 @@ function requestHandler(manager, { host, port, tls, allowedHosts }, auth) {
 }
 
 async function handleApi(request, response, manager, port, auth, secure) {
-  assertSameOrigin(request, port, request.socket.encrypted === true);
+  assertSameOrigin(request, port, secure);
   const url = new URL(request.url, `http://${request.headers.host}`);
   const { pathname } = url;
   const method = request.method ?? 'GET';
@@ -384,16 +390,32 @@ async function readJson(request) {
   }
 }
 
-function assertAllowedHost(request, port, knownHosts) {
+function assertAllowedHost(request, port, knownHosts, allowPublicHttpsPort = false) {
   const hostHeader = request.headers.host ?? '';
-  const separator = hostHeader.lastIndexOf(':');
-  const hostname = separator < 0 ? hostHeader : hostHeader.slice(0, separator);
-  const hostPort = separator < 0 ? '' : hostHeader.slice(separator + 1);
-  if (!knownHosts.has(hostname) || hostPort !== String(port)) {
+  let hostname;
+  let hostPort;
+  try {
+    const parsed = new URL(`http://${hostHeader}`);
+    hostname = parsed.hostname.toLowerCase();
+    hostPort = parsed.port;
+  } catch {
+    hostname = '';
+    hostPort = '';
+  }
+  const portAllowed = hostPort === String(port)
+    || (allowPublicHttpsPort && (hostPort === '' || hostPort === '443'));
+  if (!knownHosts.has(hostname) || !portAllowed) {
     const error = new Error('This panel only accepts requests addressed to an allowed local interface.');
     error.status = 403;
     throw error;
   }
+}
+
+function isLoopbackAddress(address = '') {
+  return address === '127.0.0.1'
+    || address === '::1'
+    || address.startsWith('127.')
+    || address.startsWith('::ffff:127.');
 }
 
 function assertSameOrigin(request, port, secure) {

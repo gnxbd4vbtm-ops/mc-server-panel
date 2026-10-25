@@ -28,13 +28,51 @@ Optional data locations are configured with `BSP_DATA_DIR`, `BSP_SERVERS_DIR`, `
 
 The panel binds only to `127.0.0.1` by default and requires an administrator password. On first run, copy the one-time setup token from the terminal into the panel and choose a password of at least 12 characters. Sessions expire after 12 hours; repeated failed logins are rate-limited.
 
-LAN access is an explicit opt-in and requires HTTPS. Supply a certificate and private key, then set `BSP_HOST` to a host interface address or wildcard such as `0.0.0.0`:
+LAN access is an explicit opt-in and requires HTTPS. To serve the panel on a domain, keep the panel bound to loopback and put a trusted proxy or Cloudflare Tunnel in front of it. Set the exact public hostname in `BSP_ALLOWED_HOSTS` and enable proxy-header trust only when the proxy connects locally:
 
 ```sh
-BSP_HOST=0.0.0.0 BSP_TLS_CERT=/path/to/cert.pem BSP_TLS_KEY=/path/to/key.pem npm start
+BSP_HOST=127.0.0.1 BSP_ALLOWED_HOSTS=panel.example.com BSP_TRUST_PROXY=true npm start
 ```
 
-For hostnames not matching an interface address, add comma-separated names with `BSP_ALLOWED_HOSTS`. Do not expose the panel to the public internet. The panel does not install a service, configure a firewall, or enable LAN access unless explicitly configured.
+### Run as a systemd service with Cloudflare Tunnel
+
+An example unit is provided at [`deploy/byte-server-panel.service.example`](./deploy/byte-server-panel.service.example). Edit its `User`, `Group`, `WorkingDirectory`, `PATH`, and `BSP_ALLOWED_HOSTS` values to match your server. The unit runs `npm run build` (the project's source checks) before starting the app, starts automatically at boot, and restarts the app after failures or manual restarts.
+
+Install and enable it:
+
+```sh
+sudo cp deploy/byte-server-panel.service.example /etc/systemd/system/byte-server-panel.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now byte-server-panel
+sudo systemctl status byte-server-panel
+```
+
+Make sure the service user owns the project and its `.data/` directory. If Node.js/npm are installed outside `/usr/local/bin`, `/usr/bin`, or `/bin` (for example, with nvm), update the unit's `PATH` to include their actual install directory. After updating the application code, run `sudo systemctl restart byte-server-panel`; the build checks run before it starts.
+
+Configure the Cloudflare Tunnel public hostname to use `http://127.0.0.1:18765` as its service. The origin request must send `panel.example.com` as the HTTP `Host` header. For a locally managed `cloudflared` tunnel, the relevant ingress configuration is:
+
+```yaml
+ingress:
+  - hostname: panel.example.com
+    service: http://127.0.0.1:18765
+    originRequest:
+      httpHostHeader: panel.example.com
+  - service: http_status:404
+```
+
+Keep the tunnel credentials and the rest of its configuration as provided by your Cloudflare setup. If you configure the tunnel in the Cloudflare dashboard, set the origin's HTTP Host Header to `panel.example.com` there instead. The tunnel agent connects from loopback, where `BSP_TRUST_PROXY=true` permits its HTTPS-forwarding header to be used; `BSP_ALLOWED_HOSTS` still restricts requests to the configured domain. Use Cloudflare Access or an equivalent identity gate to restrict who can reach the panel, in addition to the panel's administrator login.
+
+For a locally hosted Caddy proxy instead, an example site is:
+
+```caddyfile
+panel.example.com {
+    reverse_proxy 127.0.0.1:18765
+}
+```
+
+Caddy obtains and renews HTTPS certificates when the domain points to this machine and ports 80/443 reach Caddy. `BSP_TRUST_PROXY=true` trusts `X-Forwarded-Proto` only when the connection to the panel comes from a loopback address; the public hostname must still exactly match `BSP_ALLOWED_HOSTS`. Restart the panel after changing environment variables. Alternatively, bind directly to a network interface with `BSP_HOST=0.0.0.0` and provide `BSP_TLS_CERT` and `BSP_TLS_KEY`.
+
+Do not expose the panel directly to the public internet. If the domain is publicly reachable, restrict access at the proxy or network layer (for example, with a VPN or identity-aware access gateway) and keep the panel's administrator password enabled. The panel does not install a service, configure DNS/firewall rules, or enable network access unless explicitly configured.
 
 ## Available today
 
@@ -67,8 +105,8 @@ For hostnames not matching an interface address, add comma-separated names with 
 - Forge-family and Fabric/Quilt installer artifacts are checksum-verified before execution. Those vendor installers may download their runtime libraries during installation; the panel does not independently mirror or pin every transitive library.
 - Modrinth imports require server-compatible projects and checksummed downloads. Client-only files are skipped; overrides do not replace the panel-managed `server.properties` or EULA. Updates, dependency conflict resolution, and automatic rollback are not provided.
 - Process reattachment depends on Linux `/proc`, a valid managed process ID, and enabled local RCON. If RCON is unavailable, the server remains detached and must be stopped or verified manually. Player counts remain unavailable.
-- The panel does not collect network/TPS metrics, install Java, change persistent host/network configuration, or run as a system service.
-- LAN use requires a valid TLS certificate/key and an explicit bind-address change. Do not expose this privileged panel to the public internet.
+- The panel does not collect network/TPS metrics, install Java, change persistent host/network configuration, or install the example systemd unit automatically.
+- Network access requires HTTPS and explicit host/bind configuration. Do not expose this privileged panel directly to the public internet.
 
 ## Security and data handling
 

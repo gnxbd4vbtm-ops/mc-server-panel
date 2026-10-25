@@ -8,6 +8,7 @@ const host = process.env.BSP_HOST ?? '127.0.0.1';
 const tlsCertPath = process.env.BSP_TLS_CERT ? path.resolve(process.env.BSP_TLS_CERT) : null;
 const tlsKeyPath = process.env.BSP_TLS_KEY ? path.resolve(process.env.BSP_TLS_KEY) : null;
 const allowedHosts = (process.env.BSP_ALLOWED_HOSTS ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
+const trustProxy = process.env.BSP_TRUST_PROXY === 'true';
 const backupRetention = Number.parseInt(process.env.BSP_BACKUP_RETENTION ?? '10', 10);
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -30,6 +31,7 @@ export const config = Object.freeze({
   port,
   isLoopbackHost,
   allowedHosts,
+  trustProxy,
   tls: tlsCertPath ? {
     cert: readFileSync(tlsCertPath),
     key: readFileSync(tlsKeyPath)
