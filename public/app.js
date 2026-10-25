@@ -312,6 +312,9 @@ function render() {
   if (contentServers.some((server) => server.id === previousContentServer)) {
     $('#modrinth-server').value = previousContentServer;
   }
+  if ($('#modrinth-server').value !== previousContentServer) {
+    $('#modrinth-results').replaceChildren();
+  }
   updateModrinthCompatibility();
   $('#schedule-list').innerHTML = state.schedules.length ? state.schedules.map((schedule) => {
     const server = state.servers.find((item) => item.id === schedule.serverId);
@@ -438,7 +441,11 @@ async function installModrinthProject(button, server) {
   } catch (error) {
     toast(error.message, 'error');
   } finally {
-    if (!button.dataset.installTask) button.disabled = false;
+    if (!button.dataset.installTask) {
+      button.disabled = button.dataset.uninstallContent
+        ? !['stopped', 'crashed'].includes(server.status)
+        : false;
+    }
   }
 }
 

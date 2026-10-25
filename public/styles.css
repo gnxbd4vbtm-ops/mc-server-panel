@@ -97,8 +97,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .stat-card > small { color: var(--subtle); font-size: 10px; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; margin: 31px 0 14px; }
 .section-heading h2 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
-.section-heading p { margin: 0; color: var(--muted); font-size: 10px; }
-.text-link { color: var(--accent); font-size: 10px; font-weight: 600; }
+.section-heading p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+.text-link { color: var(--accent); font-size: 13px; font-weight: 600; }
 .text-link span { margin-left: 4px; }
 .server-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 13px; }
 .server-card { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); transition: border-color .15s, transform .15s; }
@@ -148,13 +148,13 @@ select { min-height: 35px; padding: 0 28px 0 10px; border: 1px solid var(--borde
 .event-indicator.error { background: var(--red); }
 .event-indicator.warning { background: var(--yellow); }
 .event-indicator.success { background: var(--accent); }
-.event-message { overflow: hidden; color: #c2ccd6; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.event-meta { display: flex; align-items: center; gap: 10px; color: var(--subtle); font-size: 9px; white-space: nowrap; }
+.event-message { overflow: hidden; color: #c2ccd6; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.event-meta { display: flex; align-items: center; gap: 10px; color: var(--subtle); font-size: 12px; white-space: nowrap; }
 .event-server { color: var(--muted); }
 .empty-state { padding: 37px 18px; display: grid; justify-items: center; gap: 10px; border: 1px dashed #34414e; border-radius: 8px; color: var(--muted); text-align: center; }
 .empty-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 11px; background: var(--accent-soft); color: var(--accent); font-size: 19px; }
 .empty-state strong { color: var(--text); font-size: 12px; }
-.empty-state p { max-width: 360px; margin: 0; font-size: 10px; line-height: 1.6; }
+.empty-state p { max-width: 360px; margin: 0; font-size: 13px; line-height: 1.6; }
 .catalog-callout { display: flex; gap: 12px; margin: 0 0 18px; padding: 14px; border: 1px solid rgba(105,170,255,.19); border-radius: 8px; background: rgba(105,170,255,.045); }
 .callout-icon { width: 27px; height: 27px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 6px; background: rgba(105,170,255,.12); color: var(--blue); }
 .catalog-callout strong { font-size: 11px; font-weight: 600; }
@@ -236,8 +236,8 @@ body.light .console-output { background: #131920; color: #d5dee6; }
 .console-output { font-size: 13px; }
 .console-form input { font-size: 13px; }
 .toast { font-size: 13px; }
-.event-message { font-size: 13px; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
-.event-meta { font-size: 11px; }
+.event-message { font-size: 14px; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+.event-meta { font-size: 12px; }
 .task-card-top { font-size: 12px; }
 .server-ident small { font-size: 12px; }
 
