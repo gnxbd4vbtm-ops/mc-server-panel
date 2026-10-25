@@ -516,6 +516,7 @@ async function openConsole(server) {
 }
 
 async function openAdmin(server, tab = 'files') {
+  clearInterval(state.consoleLogInterval);
   state.adminServerId = server.id;
   state.consoleServerId = server.id;
   state.fileDirectory = '';
@@ -531,9 +532,8 @@ async function openAdmin(server, tab = 'files') {
     : 'The server is stopped. Start it to send commands; existing logs remain available.';
   await activateManageTab(tab);
   $('#admin-dialog').showModal();
-  clearInterval(state.consoleLogInterval);
   state.consoleLogInterval = setInterval(() => void refreshConsole(), 2000);
-  if (['running', 'orphaned'].includes(server.status)) await refreshConsole();
+  await refreshConsole();
 }
 
 async function activateManageTab(tab) {

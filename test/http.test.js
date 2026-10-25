@@ -96,8 +96,16 @@ test('serves the dashboard and protects local API mutations from foreign origins
 
   const page = await fetch(baseUrl);
   assert.equal(page.status, 200);
-  assert.match(await page.text(), /Byte Server Panel/);
+  const pageMarkup = await page.text();
+  assert.match(pageMarkup, /Byte Server Panel/);
+  for (const section of ['files', 'mods', 'plugins', 'worlds', 'console', 'logs']) {
+    assert.match(pageMarkup, new RegExp(`data-manage-tab="${section}"`));
+  }
+  assert.equal(pageMarkup.includes('console-dialog'), false);
   assert.equal(page.headers.get('content-security-policy')?.includes("frame-ancestors 'none'"), true);
+  const appSource = await fetch(`${baseUrl}/app.js`).then((response) => response.text());
+  assert.match(appSource, /class="delete-server-button"/);
+  assert.equal(appSource.includes('>⋯</button>'), false);
 
   assert.equal((await fetch(`${baseUrl}/api/servers`)).status, 401);
   assert.deepEqual(await (await localFetch(`${baseUrl}/api/java`)).json(), []);
