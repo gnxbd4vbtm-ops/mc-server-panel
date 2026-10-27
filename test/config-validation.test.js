@@ -45,4 +45,8 @@ test('requires paired TLS credentials and HTTPS for non-loopback binding', async
   });
   assert.equal(lanWithTls.status, 0, lanWithTls.stderr);
   assert.equal(lanWithTls.stdout.trim(), 'true');
+
+  const invalidStartupTimeout = runConfig({ BSP_STARTUP_TIMEOUT_MS: '10' });
+  assert.notEqual(invalidStartupTimeout.status, 0);
+  assert.match(invalidStartupTimeout.stderr, /BSP_STARTUP_TIMEOUT_MS/);
 });

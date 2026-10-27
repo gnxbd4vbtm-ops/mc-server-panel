@@ -66,6 +66,7 @@ export class ServerManager {
     this.backupDir = options.backupDir ?? config.backupDir;
     this.backupRetention = options.backupRetention ?? config.backupRetention;
     this.availableMemoryMb = options.availableMemoryMb ?? config.availableMemoryMb;
+    this.startupTimeoutMs = options.startupTimeoutMs ?? config.startupTimeoutMs;
     this.javaCandidates = options.javaCandidates;
     this.javaRuntimeCache = null;
     this.reconcileInterval = null;
@@ -77,6 +78,7 @@ export class ServerManager {
     this.metricsSamples = new Map();
     this.rconProbeAfter = new Map();
     this.remoteLogState = new Map();
+    this.diskSizeCache = new Map();
     this.schedulingActive = false;
   }
 
@@ -199,11 +201,19 @@ export class ServerManager {
   async listServers() {
     return Promise.all(this.db.listServers().map(async (server) => {
       try {
-        return { ...publicServer(server), players: null, uptimeSeconds: this.getUptime(server.id), diskBytes: await directorySize(server.directory), diskError: null };
+        return { ...publicServer(server), players: null, uptimeSeconds: this.getUptime(server.id), diskBytes: await this.cachedDirectorySize(server.directory), diskError: null };
       } catch (error) {
         return { ...publicServer(server), players: null, uptimeSeconds: this.getUptime(server.id), diskBytes: null, diskError: safeMessage(error) };
       }
     }));
+  }
+
+  async cachedDirectorySize(directory, maxAgeMs = 60000) {
+    const cached = this.diskSizeCache.get(directory);
+    if (cached && Date.now() - cached.capturedAt < maxAgeMs) return cached.bytes;
+    const bytes = await directorySize(directory);
+    this.diskSizeCache.set(directory, { bytes, capturedAt: Date.now() });
+    return bytes;
   }
 
   getServer(id) {
@@ -681,10 +691,11 @@ export class ServerManager {
     const promise = new Promise((resolve) => setImmediate(resolve))
       .then(() => this.executeTask(taskId, input, controller));
     this.taskPromises.set(taskId, promise);
-    promise.finally(() => {
+    const cleanup = () => {
       this.taskControllers.delete(taskId);
       this.taskPromises.delete(taskId);
-    });
+    };
+    promise.then(cleanup, cleanup);
     return task;
   }
 
@@ -942,7 +953,7 @@ export class ServerManager {
       }
       let diskBytes = null;
       try {
-        diskBytes = await directorySize(server.directory);
+        diskBytes = await this.cachedDirectorySize(server.directory);
       } catch (error) {
         if (error.code !== 'ENOENT' && error.code !== 'EACCES') throw error;
       }
@@ -1137,37 +1148,53 @@ export class ServerManager {
       cwd: server.directory,
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
-      windowsHide: true
+      windowsHide: true,
+      // Keep Java in its own process group so closing the terminal/SSH session
+      // does not send SIGHUP/SIGINT to the running Minecraft server.
+      detached: process.platform !== 'win32'
     });
-    const runtime = { child, startedAt: Date.now(), rconPassword: server.rconPassword };
+    const runtime = { child, startedAt: Date.now(), rconPassword: server.rconPassword, outputTail: [] };
     this.runtime.set(server.id, runtime);
     this.db.updateServer(server.id, { status: 'starting', process_pid: child.pid ?? null, last_started_at: new Date().toISOString(), error: null });
     this.db.addEvent(server.id, 'info', `Starting Java process (${server.javaPath}).`);
     runtime.startupTimer = setTimeout(() => {
-      if (this.runtime.get(server.id) !== runtime || child.exitCode !== null) return;
-      if (this.db.getServer(server.id)?.status !== 'starting') return;
-      const message = 'Server did not report a ready state within 120 seconds.';
-      this.db.updateServer(server.id, { status: 'crashed', error: message });
-      this.db.addEvent(server.id, 'error', message);
-      child.kill('SIGTERM');
-      const forceTimer = setTimeout(() => {
-        if (child.exitCode === null) child.kill('SIGKILL');
-      }, 5000);
-      forceTimer.unref();
-    }, 120000);
+      void this.handleStartupTimeout(server, runtime).catch((error) => {
+        console.error(`[manager] Startup watchdog failed for server ${server.id}:`, error);
+      });
+    }, this.startupTimeoutMs);
     runtime.startupTimer.unref();
-    const consume = (stream) => stream.on('data', (chunk) => {
-      for (const line of chunk.toString().split(/\r?\n/)) {
-        if (!line) continue;
-        if (/Done \(/.test(line)) {
-          clearTimeout(runtime.startupTimer);
-          this.db.updateServer(server.id, { status: 'running', error: null });
+
+    const consume = (stream, source) => {
+      let pending = '';
+      stream.setEncoding('utf8');
+      stream.on('data', (chunk) => {
+        pending += chunk;
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop() ?? '';
+        for (const line of lines) this.consumeServerLine(server, runtime, line, source);
+        // Avoid unbounded buffering if a process writes a very long line.
+        if (pending.length > 65536) {
+          this.consumeServerLine(server, runtime, pending, source);
+          pending = '';
         }
-        this.db.addEvent(server.id, /error|exception|failed/i.test(line) ? 'error' : 'console', line.slice(0, 1000));
+      });
+      stream.on('end', () => {
+        if (pending) this.consumeServerLine(server, runtime, pending, source);
+        pending = '';
+      });
+      stream.on('error', (error) => {
+        if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error.code)) {
+          console.error(`[manager] ${source} stream error for server ${server.id}:`, error);
+        }
+      });
+    };
+    consume(child.stdout, 'stdout');
+    consume(child.stderr, 'stderr');
+    child.stdin?.on('error', (error) => {
+      if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error.code)) {
+        console.error(`[manager] stdin stream error for server ${server.id}:`, error);
       }
     });
-    consume(child.stdout);
-    consume(child.stderr);
     child.on('error', (error) => {
       clearTimeout(runtime.startupTimer);
       this.runtime.delete(server.id);
@@ -1179,11 +1206,67 @@ export class ServerManager {
       this.runtime.delete(server.id);
       const requestedStop = this.db.getServer(server.id)?.status === 'stopping';
       const status = code === 0 || requestedStop ? 'stopped' : 'crashed';
-      const error = code === 0 ? null : `Process exited with ${signal ? `signal ${signal}` : `code ${code}`}.`;
+      const error = requestedStop || code === 0
+        ? null
+        : `Process exited with ${signal ? `signal ${signal}` : `code ${code}`}.`;
       this.db.updateServer(server.id, { status, process_pid: null, error, last_stopped_at: new Date().toISOString() });
       this.db.addEvent(server.id, status === 'stopped' ? 'info' : 'error', error ?? 'Server stopped.');
     });
     return { status: 'starting', pid: child.pid ?? null };
+  }
+
+  consumeServerLine(server, runtime, line, source) {
+    if (!line || this.runtime.get(server.id) !== runtime) return;
+    runtime.outputTail.push(line);
+    if (runtime.outputTail.length > 20) runtime.outputTail.shift();
+    if (/Done \(|For help, type "help"/i.test(line)) {
+      this.markServerReady(server, runtime, 'Server reported a ready state.');
+    }
+    const kind = source === 'stderr' || /error|exception|failed/i.test(line) ? 'error' : 'console';
+    this.db.addEvent(server.id, kind, line.slice(0, 1000));
+  }
+
+  markServerReady(server, runtime, reason) {
+    if (this.runtime.get(server.id) !== runtime) return;
+    clearTimeout(runtime.startupTimer);
+    if (this.db.getServer(server.id)?.status !== 'starting') return;
+    this.db.updateServer(server.id, { status: 'running', error: null });
+    this.db.addEvent(server.id, 'success', reason);
+  }
+
+  async handleStartupTimeout(server, runtime) {
+    if (this.runtime.get(server.id) !== runtime || runtime.child.exitCode !== null) return;
+    if (this.db.getServer(server.id)?.status !== 'starting') return;
+    // A busy or modded server can take longer than the watchdog. If RCON is
+    // already answering, the server is healthy: clear the timer instead of
+    // killing the process and disconnecting everyone on it.
+    if (await this.probeRcon(server, runtime)) {
+      this.markServerReady(server, runtime, 'Server is responsive over RCON; startup watchdog cleared.');
+      return;
+    }
+    const seconds = Math.round(this.startupTimeoutMs / 1000);
+    const message = `Server did not report a ready state within ${seconds} seconds.`;
+    const tail = runtime.outputTail.slice(-5).join('\n');
+    this.db.updateServer(server.id, { status: 'crashed', error: message });
+    this.db.addEvent(server.id, 'error', tail ? `${message} Last output:\n${tail}` : message);
+    if (runtime.child.exitCode === null) runtime.child.kill('SIGTERM');
+    const forceTimer = setTimeout(() => {
+      if (runtime.child.exitCode === null) runtime.child.kill('SIGKILL');
+    }, 5000);
+    forceTimer.unref();
+  }
+
+  async probeRcon(server, runtime) {
+    if (!runtime.rconPassword || !Number.isInteger(server.rconPort)) return false;
+    try {
+      await rconCommand({
+        host: '127.0.0.1', port: server.rconPort, password: runtime.rconPassword,
+        command: 'list', timeoutMs: 2000
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async stop(id, force = false) {
@@ -1224,7 +1307,7 @@ export class ServerManager {
       return { status: 'stopping', server: server.name };
     }
     if (!force && runtime.child.exitCode === null) {
-      runtime.child.stdin.write('stop\n');
+      if (!writeToChild(runtime.child, 'stop\n')) runtime.child.kill('SIGTERM');
       this.db.updateServer(id, { status: 'stopping' });
       const timeout = setTimeout(() => {
         if (this.runtime.get(id) !== runtime || runtime.child.exitCode !== null) return;
@@ -1283,7 +1366,9 @@ export class ServerManager {
         return { sent: true, output };
       });
     }
-    runtime.child.stdin.write(`${command}\n`);
+    if (!writeToChild(runtime.child, `${command}\n`)) {
+      throw clientError('The server console is not accepting input.');
+    }
     return { sent: true };
   }
 
@@ -1589,13 +1674,26 @@ export class ServerManager {
     return { deleted: true };
   }
 
-  async shutdown() {
+  async shutdown({ stopServers = true } = {}) {
     clearInterval(this.reconcileInterval);
     clearInterval(this.schedulerTimer);
     clearInterval(this.metricsTimer);
     clearTimeout(this.initialMetricsTimer);
     for (const controller of this.taskControllers.values()) controller.abort();
     await Promise.all(this.taskPromises.values());
+    if (!stopServers) {
+      // Detach from the managed Java processes instead of stopping them. The
+      // panel can reattach through RCON on its next start, so restarting or
+      // upgrading the panel does not kick players off the server.
+      for (const runtime of this.runtime.values()) {
+        runtime.child?.unref?.();
+        runtime.child?.stdin?.unref?.();
+        runtime.child?.stdout?.unref?.();
+        runtime.child?.stderr?.unref?.();
+      }
+      this.db.addEvent(null, 'info', 'Panel exited; managed server processes were left running.');
+      return;
+    }
     const active = [...this.runtime.entries()];
     for (const [id, runtime] of active) {
       if (runtime.attached) {
@@ -1615,11 +1713,7 @@ export class ServerManager {
       }
       if (runtime.child.exitCode !== null) continue;
       this.db.updateServer(id, { status: 'stopping' });
-      try {
-        runtime.child.stdin.write('stop\n');
-      } catch {
-        runtime.child.kill('SIGTERM');
-      }
+      if (!writeToChild(runtime.child, 'stop\n')) runtime.child.kill('SIGTERM');
     }
     await Promise.all(active.map(async ([id, runtime]) => {
       if (runtime.attached) {
@@ -1644,7 +1738,13 @@ export class ServerManager {
       }, 19000);
       gracefulTimeout.unref();
       forceTimeout.unref();
-      await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 20000))]);
+      let waitTimer;
+      const exitedOrTimeout = new Promise((resolve) => {
+        waitTimer = setTimeout(resolve, 20000);
+        waitTimer.unref();
+      });
+      await Promise.race([exited, exitedOrTimeout]);
+      clearTimeout(waitTimer);
       clearTimeout(gracefulTimeout);
       clearTimeout(forceTimeout);
     }));
@@ -1736,6 +1836,9 @@ export class ServerManager {
         !(server.status === 'running' && runtime?.attached)
       )) continue;
       if (await isManagedProcess(server.processPid, server)) {
+        // A server in "stopping" must never be reattached; just wait for the
+        // process to exit so the stop request can complete.
+        if (server.status === 'stopping') continue;
         if (runtime || (this.rconProbeAfter.get(server.id)?.next ?? 0) > Date.now()) continue;
         const probe = { next: Date.now() + 10000, warned: this.rconProbeAfter.get(server.id)?.warned ?? false };
         this.rconProbeAfter.set(server.id, probe);
@@ -2307,6 +2410,17 @@ function signalProcess(pid, signal) {
     process.kill(pid, signal);
   } catch (error) {
     if (error.code !== 'ESRCH') throw error;
+  }
+}
+
+function writeToChild(child, text) {
+  const stdin = child?.stdin;
+  if (!stdin || stdin.destroyed === true || stdin.writable === false) return false;
+  try {
+    stdin.write(text);
+    return true;
+  } catch {
+    return false;
   }
 }
 

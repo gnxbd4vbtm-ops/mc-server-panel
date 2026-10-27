@@ -28,6 +28,12 @@ Optional data locations are configured with `BSP_DATA_DIR`, `BSP_SERVERS_DIR`, `
 
 The panel binds only to `127.0.0.1` by default and requires an administrator password. On first run, copy the one-time setup token from the terminal into the panel and choose a password of at least 12 characters. Sessions expire after 12 hours; repeated failed logins are rate-limited.
 
+### Server lifecycle
+
+Managed Minecraft servers keep running when the panel exits or restarts. On the next panel start, the panel finds the existing Java process and reattaches through the local RCON connection, so updating or restarting the panel does not disconnect players. To make the panel stop every managed server on shutdown instead, start it with `BSP_STOP_SERVERS_ON_SHUTDOWN=true`.
+
+The panel waits up to five minutes for a new server to report a ready state. If the server is already answering RCON when the timeout expires, the watchdog leaves it running. Change the limit with `BSP_STARTUP_TIMEOUT_MS` (30000-3600000 milliseconds).
+
 LAN access is an explicit opt-in and requires HTTPS. To serve the panel on a domain, keep the panel bound to loopback and put a trusted proxy or Cloudflare Tunnel in front of it. Set the exact public hostname in `BSP_ALLOWED_HOSTS` and enable proxy-header trust only when the proxy connects locally:
 
 ```sh
@@ -47,7 +53,7 @@ sudo systemctl enable --now byte-server-panel
 sudo systemctl status byte-server-panel
 ```
 
-Make sure the service user owns the project and its `.data/` directory. If Node.js/npm are installed outside `/usr/local/bin`, `/usr/bin`, or `/bin` (for example, with nvm), update the unit's `PATH` to include their actual install directory. After updating the application code, run `sudo systemctl restart byte-server-panel`; the build checks run before it starts.
+Make sure the service user owns the project and its `.data/` directory. If Node.js/npm are installed outside `/usr/local/bin`, `/usr/bin`, or `/bin` (for example, with nvm), update the unit's `PATH` to include their actual install directory. After updating the application code, run `sudo systemctl restart byte-server-panel`; the build checks run before it starts. The example unit uses `KillMode=process` and leaves managed servers running, so a panel restart does not disconnect players; the panel reattaches through RCON.
 
 Configure the Cloudflare Tunnel public hostname to use `http://127.0.0.1:18765` as its service. The origin request must send `panel.example.com` as the HTTP `Host` header. For a locally managed `cloudflared` tunnel, the relevant ingress configuration is:
 

@@ -827,6 +827,94 @@ test('starts a local process once, sends commands, and stops gracefully', async 
   assert.equal((await manager.getLogs(server.id)).some((entry) => entry.line.includes('Done (test)')), true);
 });
 
+test('recognizes a ready line split across stdout chunks', async () => {
+  const { manager, database } = await makeManager();
+  const executable = await fakeJava(fixtures.at(-1), 'test-java-split', '21.0.0',
+    'printf "Do"\nsleep 0.2\nprintf "ne (split)\\n"\nwhile IFS= read -r line; do [ "$line" = "stop" ] && exit 0; done\n');
+  const server = await manager.createServer({
+    name: 'Split readiness test',
+    minecraftVersion: '1.21.8',
+    port: await availablePort(),
+    memoryMb: 512,
+    javaPath: executable
+  });
+  database.updateServer(server.id, { installed: 1 });
+
+  await manager.start(server.id, { acceptEula: true });
+  await waitFor(() => database.getServer(server.id).status === 'running');
+  assert.equal((await manager.getLogs(server.id)).some((entry) => entry.line.includes('Done (split)')), true);
+  await manager.stop(server.id);
+  await waitFor(() => database.getServer(server.id).status === 'stopped');
+});
+
+test('keeps a server that is answering RCON when the startup watchdog expires', async () => {
+  const { manager, database } = await makeManager({ startupTimeoutMs: 100 });
+  const executable = await fakeJava(fixtures.at(-1), 'test-java-rcon-ready', '21.0.0',
+    'while IFS= read -r line; do [ "$line" = "stop" ] && exit 0; done\n');
+  const server = await manager.createServer({
+    name: 'RCON readiness test',
+    minecraftVersion: '1.21.8',
+    port: await availablePort(),
+    memoryMb: 512,
+    javaPath: executable
+  });
+  database.updateServer(server.id, { installed: 1, eula_accepted: 1 });
+  const internal = database.getServer(server.id);
+  const password = await manager.ensureRconConfiguration(internal);
+  const rconServer = await fakeRcon(internal.rconPort, password);
+
+  try {
+    await manager.start(server.id);
+    await waitFor(() => database.getServer(server.id).status === 'running');
+    assert.equal(manager.events(20).some((entry) => entry.message.includes('responsive over RCON')), true);
+  } finally {
+    await manager.stop(server.id).catch(() => {});
+    await new Promise((resolve, reject) => rconServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('does not leave a stale error after a requested stop exits non-zero', async () => {
+  const { root, manager, database } = await makeManager();
+  const executable = await fakeJava(root, 'test-java-nonzero-stop', '21.0.0',
+    'printf "Done (test)\\n"\nwhile IFS= read -r line; do [ "$line" = "stop" ] && exit 130; done\n');
+  const server = await manager.createServer({
+    name: 'Non-zero stop test',
+    minecraftVersion: '1.21.8',
+    port: await availablePort(),
+    memoryMb: 512,
+    javaPath: executable
+  });
+  database.updateServer(server.id, { installed: 1, eula_accepted: 1 });
+
+  await manager.start(server.id);
+  await waitFor(() => database.getServer(server.id).status === 'running');
+  await manager.stop(server.id);
+  await waitFor(() => database.getServer(server.id).status === 'stopped');
+  const stopped = database.getServer(server.id);
+  assert.equal(stopped.error, null);
+});
+
+test('can leave a running server up while the panel shuts down', async () => {
+  const { root, manager, database } = await makeManager();
+  const executable = await fakeJava(root, 'test-java-preserve');
+  const server = await manager.createServer({
+    name: 'Preserve test',
+    minecraftVersion: '1.21.8',
+    port: await availablePort(),
+    memoryMb: 512,
+    javaPath: executable
+  });
+  database.updateServer(server.id, { installed: 1, eula_accepted: 1 });
+
+  await manager.start(server.id);
+  await waitFor(() => database.getServer(server.id).status === 'running');
+  const pid = database.getServer(server.id).processPid;
+  await manager.shutdown({ stopServers: false });
+  assert.doesNotThrow(() => process.kill(pid, 0));
+  await manager.shutdown();
+  await waitFor(() => database.getServer(server.id).status === 'stopped');
+});
+
 test('gracefully restarts a running server and waits until the replacement is ready', async () => {
   const { root, manager, database } = await makeManager();
   const executable = await fakeJava(root, 'test-java-restart');

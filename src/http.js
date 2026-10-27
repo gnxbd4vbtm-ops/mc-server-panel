@@ -172,7 +172,7 @@ async function handleApi(request, response, manager, port, auth, secure) {
       'Content-Length': backup.sizeBytes,
       'Content-Disposition': `attachment; filename="${backup.filename}"`
     });
-    createReadStream(backup.path).pipe(response);
+    pipeReadStream(createReadStream(backup.path), response, 'backup download');
     return;
   }
   const backupDeleteMatch = pathname.match(/^\/api\/backups\/([a-z0-9-]+)$/);
@@ -366,7 +366,19 @@ async function serveStatic(request, response) {
     'Content-Length': fileStat.size
   });
   if (request.method === 'HEAD') response.end();
-  else createReadStream(filePath).pipe(response);
+  else pipeReadStream(createReadStream(filePath), response, 'static file');
+}
+
+function pipeReadStream(stream, response, label) {
+  stream.on('error', (error) => {
+    console.error(`[http] ${label} stream failed:`, error);
+    if (!response.headersSent) {
+      sendJson(response, 500, { error: 'The file could not be read.' });
+    } else {
+      response.destroy(error);
+    }
+  });
+  stream.pipe(response);
 }
 
 async function readJson(request) {

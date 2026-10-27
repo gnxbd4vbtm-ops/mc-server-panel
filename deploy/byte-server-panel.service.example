@@ -14,12 +14,18 @@ Environment="BSP_HOST=127.0.0.1"
 Environment="BSP_PORT=18765"
 Environment="BSP_ALLOWED_HOSTS=panel.example.com"
 Environment="BSP_TRUST_PROXY=true"
+# Keep Minecraft servers running when the panel is restarted. Set to true if
+# stopping the panel should also stop every managed server.
+Environment="BSP_STOP_SERVERS_ON_SHUTDOWN=false"
 UMask=0077
 ExecStartPre=npm run build
 ExecStart=node src/main.js
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=30
+# Only signal the panel process. Managed Java servers are in their own process
+# group and are reattached through RCON after the panel restarts.
+KillMode=process
+TimeoutStopSec=45
 
 [Install]
 WantedBy=multi-user.target
